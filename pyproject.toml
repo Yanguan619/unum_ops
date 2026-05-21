@@ -12,8 +12,8 @@ dependencies = [
     "pandas>=2.3.3",
     "pre-commit>=4.6.0",
     "pytest>=9.0.3",
-    "torch==2.9.0",
-    "triton==3.5.0",
+    "torch>=2.9.0",
+    "triton>=3.2.0",
 ]
 
 [project.scripts]
