@@ -263,19 +263,6 @@ def test_get_table_triton(diverse_test_data):
     assert torch.allclose(out_v1, out_triton), "triton output differs from v1"
 
 
-def benchmark_kernel(name, func, *args, N=100):
-    import time
-
-    import torch
-
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(N):
-        func(*args)
-    torch.cuda.synchronize()
-    return (time.perf_counter() - t0) / N * 1000
-
-
 def test_bench_get_table_triton(test_data):
     @triton.testing.perf_report(
         triton.testing.Benchmark(
@@ -291,11 +278,11 @@ def test_bench_get_table_triton(test_data):
                 "cuda3",
             ],  # Possible values for `line_arg`.
             line_names=[
-                "Triton",
-                "Torch",
-                "CUDA v1",
-                "CUDA v2",
-                "CUDA v3",
+                "Triton(ms)",
+                "Torch(ms)",
+                "CUDA v1(ms)",
+                "CUDA v2(ms)",
+                "CUDA v3(ms)",
             ],  # Label name for the lines.
             styles=[
                 ("blue", "-"),
@@ -304,8 +291,8 @@ def test_bench_get_table_triton(test_data):
                 ("yellow", "-"),
                 ("orange", "-"),
             ],  # Line styles.
-            ylabel="GB/s",  # Label name for the y-axis.
-            plot_name="vector-add-performance",  # Name for the plot. Used also as a file name for saving the plot.
+            ylabel="Latency (ms)",  # Label name for the y-axis.
+            plot_name="Get-block-table-performance",  # Name for the plot. Used also as a file name for saving the plot.
             args={},  # Values for function arguments not in `x_names` and `y_name`.
         )
     )
@@ -354,78 +341,7 @@ def test_bench_get_table_triton(test_data):
         else:
             raise ValueError(f"Unknown provider: {provider}")
 
-        def gbps(ms):
-            return 3 * topk_idx.numel() * topk_idx.element_size() * 1e-9 / (ms * 1e-3)
+        return ms, min_ms, max_ms
 
-        return gbps(ms), gbps(max_ms), gbps(min_ms)
-
-    benchmark.run(print_data=True, show_plots=True)
-
-
-def test_bench_get_table(test_data):
-    topk_idx = test_data["topk_idx"]
-    block_table = test_data["block_table"]
-    token_to_bs = test_data["token_to_bs"]
-    seqlen_q = test_data["seqlen_q"]
-
-    kernels = [
-        (
-            "Torch",
-            lambda: get_block_table_ref_torch(
-                topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q
-            ),
-        ),
-        (
-            "Triton",
-            lambda: get_block_table_ref_triton(
-                topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q
-            ),
-        ),
-        (
-            "CUDA v1",
-            lambda: sparse_kernel_extension.get_block_table_v1(
-                topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q, kSparseTopK
-            ),
-        ),
-        (
-            "CUDA v2",
-            lambda: sparse_kernel_extension.get_block_table_v2(
-                topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q, kSparseTopK
-            ),
-        ),
-        (
-            "CUDA v3",
-            lambda: sparse_kernel_extension.get_block_table_v3(
-                topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q, kSparseTopK
-            ),
-        ),
-    ]
-
-    for _ in range(10):
-        for _, func in kernels:
-            func()
-
-    times = {name: benchmark_kernel(name, func) for name, func in kernels}
-
-    import pandas as pd
-
-    pd.set_option("display.max_colwidth", 20)
-    pd.set_option("display.width", 100)
-
-    data = []
-    for name in ["Torch", "Triton", "CUDA v1", "CUDA v2", "CUDA v3"]:
-        t = times[name]
-        vs_v1 = f"{t / times['CUDA v1']:.1f}x" if name != "CUDA v1" else "1.0x"
-        vs_v3 = f"{t / times['CUDA v3']:.1f}x" if name != "CUDA v3" else "1.0x"
-        data.append(
-            {
-                "Kernel": name,
-                "Latency (ms)": f"{t:.3f}",
-                "vs CUDA v1": vs_v1,
-                "vs CUDA v3": vs_v3,
-            }
-        )
-
-    df = pd.DataFrame(data)
     print("\n")
-    print(df.to_string(index=False, col_space=12))
+    benchmark.run(print_data=True, show_plots=False)
