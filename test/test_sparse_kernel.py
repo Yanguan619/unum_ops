@@ -1,12 +1,14 @@
 import pytest
 import sparse_kernel_extension
 import torch
+import triton
 
 from unum_ops.sparse_kernel_extension import (
     get_block_table_ref_torch,
     get_block_table_ref_triton,
 )
 
+DEVICE = "cuda:0"
 torch.manual_seed(42)
 # decode
 kHeadGroup = 2
@@ -272,6 +274,92 @@ def benchmark_kernel(name, func, *args, N=100):
         func(*args)
     torch.cuda.synchronize()
     return (time.perf_counter() - t0) / N * 1000
+
+
+def test_bench_get_table_triton(test_data):
+    @triton.testing.perf_report(
+        triton.testing.Benchmark(
+            x_names=["size"],  # Argument names to use as an x-axis for the plot.
+            x_vals=[0],  # Different possible values for `x_name`.
+            x_log=True,  # x axis is logarithmic.
+            line_arg="provider",  # Argument name whose value corresponds to a different line in the plot.
+            line_vals=[
+                "triton",
+                "torch",
+                "cuda",
+                "cuda2",
+                "cuda3",
+            ],  # Possible values for `line_arg`.
+            line_names=[
+                "Triton",
+                "Torch",
+                "CUDA v1",
+                "CUDA v2",
+                "CUDA v3",
+            ],  # Label name for the lines.
+            styles=[
+                ("blue", "-"),
+                ("green", "-"),
+                ("red", "-"),
+                ("yellow", "-"),
+                ("orange", "-"),
+            ],  # Line styles.
+            ylabel="GB/s",  # Label name for the y-axis.
+            plot_name="vector-add-performance",  # Name for the plot. Used also as a file name for saving the plot.
+            args={},  # Values for function arguments not in `x_names` and `y_name`.
+        )
+    )
+    def benchmark(size, provider):
+        topk_idx = test_data["topk_idx"]
+        block_table = test_data["block_table"]
+        token_to_bs = test_data["token_to_bs"]
+        seqlen_q = test_data["seqlen_q"]
+
+        quantiles = [0.5, 0.2, 0.8]
+        if provider == "torch":
+            ms, min_ms, max_ms = triton.testing.do_bench(
+                lambda: get_block_table_ref_torch(
+                    topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q
+                ),
+                quantiles=quantiles,
+            )
+        elif provider == "triton":
+            ms, min_ms, max_ms = triton.testing.do_bench(
+                lambda: get_block_table_ref_triton(
+                    topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q
+                ),
+                quantiles=quantiles,
+            )
+        elif provider == "cuda":
+            ms, min_ms, max_ms = triton.testing.do_bench(
+                lambda: sparse_kernel_extension.get_block_table_v1(
+                    topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q, kSparseTopK
+                ),
+                quantiles=quantiles,
+            )
+        elif provider == "cuda2":
+            ms, min_ms, max_ms = triton.testing.do_bench(
+                lambda: sparse_kernel_extension.get_block_table_v2(
+                    topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q, kSparseTopK
+                ),
+                quantiles=quantiles,
+            )
+        elif provider == "cuda3":
+            ms, min_ms, max_ms = triton.testing.do_bench(
+                lambda: sparse_kernel_extension.get_block_table_v3(
+                    topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q, kSparseTopK
+                ),
+                quantiles=quantiles,
+            )
+        else:
+            raise ValueError(f"Unknown provider: {provider}")
+
+        def gbps(ms):
+            return 3 * topk_idx.numel() * topk_idx.element_size() * 1e-9 / (ms * 1e-3)
+
+        return gbps(ms), gbps(max_ms), gbps(min_ms)
+
+    benchmark.run(print_data=True, show_plots=True)
 
 
 def test_bench_get_table(test_data):

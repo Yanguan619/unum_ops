@@ -1,7 +1,8 @@
 import pytest
 import torch
-from unum_ops.infllm_v2 import infllmv2_attn_stage1_ref_torch
 from infllm_v2 import infllmv2_attn_stage1
+
+from unum_ops.infllm_v2 import infllmv2_attn_stage1_ref_torch
 
 
 @pytest.mark.parametrize("seqlen_q", [64, 256])
@@ -36,15 +37,14 @@ def test_flash_attn_varlen(
         cu_seqlens_k[i + 1] = cu_seqlens_k[i] + seqlen_ks[i]
 
     # 朴素实现
-    if not bench:
-        naive_score = infllmv2_attn_stage1_ref_torch(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            causal=causal,
-        )
+    naive_score = infllmv2_attn_stage1_ref_torch(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        causal=causal,
+    )
 
     q = q.transpose(0, 1).contiguous().clone()
     k = k.transpose(0, 1).contiguous().clone()
