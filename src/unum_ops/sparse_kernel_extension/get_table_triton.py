@@ -8,11 +8,18 @@ kSparseBlockSize = 64
 
 @triton.jit
 def get_block_table_kernel(
-    topk_idx_ptr, block_table_ptr, token_to_bs_ptr, token_pos_in_bs_ptr, seqlen_q_ptr,
+    topk_idx_ptr,
+    block_table_ptr,
+    token_to_bs_ptr,
+    token_pos_in_bs_ptr,
+    seqlen_q_ptr,
     out_ptr,
-    stride_topk_idx_0, stride_topk_idx_1, stride_topk_idx_2,
+    stride_topk_idx_0,
+    stride_topk_idx_1,
+    stride_topk_idx_2,
     stride_block_table_0,
-    stride_out_0, stride_out_1,
+    stride_out_0,
+    stride_out_1,
     seqlen_q_max,
     token_num,
     HEAD_GROUP: tl.constexpr,
@@ -34,9 +41,11 @@ def get_block_table_kernel(
     pos_in_bs = tl.load(token_pos_in_bs_ptr + token_idx)
     seqlen_q_bs = tl.load(seqlen_q_ptr + bs)
 
-    topk_offset = (head_idx * stride_topk_idx_0 +
-                   token_idx * stride_topk_idx_1 +
-                   topk_idx_in_head * stride_topk_idx_2)
+    topk_offset = (
+        head_idx * stride_topk_idx_0
+        + token_idx * stride_topk_idx_1
+        + topk_idx_in_head * stride_topk_idx_2
+    )
     sparse_block_idx = tl.load(topk_idx_ptr + topk_offset)
 
     if sparse_block_idx < 0:
@@ -45,9 +54,12 @@ def get_block_table_kernel(
     offsets = tl.arange(0, SPARSE_BLOCK_SIZE)
     token_idx_in_batch = sparse_block_idx * SPARSE_BLOCK_SIZE + offsets
 
-    out_offset = (token_idx * stride_out_0 +
-                  head_idx * stride_out_1 +
-                  topk_idx_in_head * SPARSE_BLOCK_SIZE + offsets)
+    out_offset = (
+        token_idx * stride_out_0
+        + head_idx * stride_out_1
+        + topk_idx_in_head * SPARSE_BLOCK_SIZE
+        + offsets
+    )
 
     valid = (token_idx_in_batch < seqlen_q_bs) & (token_idx_in_batch < pos_in_bs)
 
@@ -58,7 +70,14 @@ def get_block_table_kernel(
     tl.store(out_ptr + out_offset, out_val)
 
 
-def get_block_table_ref_triton(topk_idx, block_table, token_to_bs, token_pos_in_bs, seqlen_q, topk=None):
+def get_block_table_ref_triton(
+    topk_idx: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_bs: torch.Tensor,
+    token_pos_in_bs: torch.Tensor,
+    seqlen_q: torch.Tensor,
+    topk=None,
+):
     H, T, K = topk_idx.shape
     S = kSparseBlockSize
     batch_size = block_table.size(0)
@@ -75,12 +94,20 @@ def get_block_table_ref_triton(topk_idx, block_table, token_to_bs, token_pos_in_
 
     grid = (T * H * K,)
     get_block_table_kernel[grid](
-        topk_idx, block_table, token_to_bs, token_pos_in_bs, seqlen_q,
+        topk_idx,
+        block_table,
+        token_to_bs,
+        token_pos_in_bs,
+        seqlen_q,
         out,
-        topk_idx.stride(0), topk_idx.stride(1), topk_idx.stride(2),
+        topk_idx.stride(0),
+        topk_idx.stride(1),
+        topk_idx.stride(2),
         block_table.stride(0),
-        out.stride(0), out.stride(1),
-        block_table.size(1), T,
+        out.stride(0),
+        out.stride(1),
+        block_table.size(1),
+        T,
         HEAD_GROUP=H,
         SPARSE_BLOCK_SIZE=S,
         SPARSE_TOPK=K,

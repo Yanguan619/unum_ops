@@ -3,9 +3,20 @@ import torch
 from unum_ops.infllm_v2 import infllmv2_attn_stage1_ref_torch
 from infllm_v2 import infllmv2_attn_stage1
 
+
 @pytest.mark.parametrize("seqlen_q", [64, 256])
 @pytest.mark.parametrize("seqlen_k", [15, 16, 129])
-def test_flash_attn_varlen(seqlen_q, seqlen_k, n_heads=32, n_kv_heads=2, head_dim=128, dtype=torch.bfloat16, bench=False, causal=True, batch_size=1):
+def test_flash_attn_varlen(
+    seqlen_q,
+    seqlen_k,
+    n_heads=32,
+    n_kv_heads=2,
+    head_dim=128,
+    dtype=torch.bfloat16,
+    bench=False,
+    causal=True,
+    batch_size=1,
+):
     # 生成不同长度的序列
     seqlen_qs = [seqlen_q]  # 两个序列，长度不同
     seqlen_ks = [seqlen_k]  # k 也使用不同长度
@@ -18,15 +29,22 @@ def test_flash_attn_varlen(seqlen_q, seqlen_k, n_heads=32, n_kv_heads=2, head_di
     v = torch.randn(n_kv_heads, total_seqlen_k, head_dim, dtype=dtype).cuda()
 
     # 计算累积序列长度
-    cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int32, device='cuda')
-    cu_seqlens_k = torch.zeros(batch_size + 1, dtype=torch.int32, device='cuda')
+    cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int32, device="cuda")
+    cu_seqlens_k = torch.zeros(batch_size + 1, dtype=torch.int32, device="cuda")
     for i in range(batch_size):
         cu_seqlens_q[i + 1] = cu_seqlens_q[i] + seqlen_qs[i]
         cu_seqlens_k[i + 1] = cu_seqlens_k[i] + seqlen_ks[i]
 
     # 朴素实现
     if not bench:
-        naive_score = infllmv2_attn_stage1_ref_torch(q, k, v, cu_seqlens_q, cu_seqlens_k, causal=causal,)
+        naive_score = infllmv2_attn_stage1_ref_torch(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            causal=causal,
+        )
 
     q = q.transpose(0, 1).contiguous().clone()
     k = k.transpose(0, 1).contiguous().clone()

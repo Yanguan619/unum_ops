@@ -25,14 +25,19 @@ def get_block_table_ref_torch(
     seqlen = seqlen_q.expand_as(bs) if seqlen_q.numel() == 1 else seqlen_q[bs]
     pos_limit = token_pos_in_bs
 
-    valid = ~neg_flat & (pos_flat < seqlen.unsqueeze(0).unsqueeze(-1)) & (pos_flat < pos_limit.unsqueeze(0).unsqueeze(-1))
+    valid = (
+        ~neg_flat
+        & (pos_flat < seqlen.unsqueeze(0).unsqueeze(-1))
+        & (pos_flat < pos_limit.unsqueeze(0).unsqueeze(-1))
+    )
 
     safe_pos = pos_flat.clamp(0, L - 1)
     tbl = block_table[bs]
     vals = torch.gather(tbl.unsqueeze(0).expand(H, -1, -1), 2, safe_pos)
 
-    out = kHeadGroup * vals + torch.arange(H, device=topk_idx.device, dtype=topk_idx.dtype).reshape(-1, 1, 1)
+    out = kHeadGroup * vals + torch.arange(
+        H, device=topk_idx.device, dtype=topk_idx.dtype
+    ).reshape(-1, 1, 1)
     out = torch.where(valid, out, 0)
 
     return out.permute(1, 0, 2).contiguous()
-
