@@ -1,13 +1,16 @@
 import logging
 
 import pytest
-import sparse_kernel_extension
 import torch
 import triton
+
+if torch.cuda.is_available():
+    import sparse_kernel_extension
 
 from unum_ops.sparse_kernel_extension import (
     get_block_table_ref_torch,
     get_block_table_ref_triton,
+    get_block_table_ref_triton_v2,
 )
 
 logging.basicConfig(level=logging.DEBUG)
@@ -24,9 +27,12 @@ topk_max_val = seqlen_q_max // kSparseBlockSize
 
 @pytest.fixture(scope="session")
 def device():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-    return torch.device("cuda:0")
+    if torch.cuda.is_available():
+        return torch.device("cuda:0")
+    elif torch.npu.is_available():
+        return torch.device("npu:0")
+    else:
+        return torch.device("cpu")
 
 
 def gen_topk(batch_size, topk_max_val, device):
@@ -130,65 +136,20 @@ def test_get_block_table_v1(test_data):
     assert out_block_table.device.type == "cuda"
 
 
-def test_v2_matches_v1(test_data):
-    out_v1 = sparse_kernel_extension.get_block_table_v1(
-        test_data["topk_idx"],
-        test_data["block_table"],
-        test_data["token_to_bs"],
-        test_data["seqlen_q"],
-        test_data["seqlen_q"],
-        kSparseTopK,
-    )
-    out_v2 = sparse_kernel_extension.get_block_table_v2(
-        test_data["topk_idx"],
-        test_data["block_table"],
-        test_data["token_to_bs"],
-        test_data["seqlen_q"],
-        test_data["seqlen_q"],
-        kSparseTopK,
-    )
-    assert torch.allclose(out_v1, out_v2), "v2 output differs from v1"
+def ops_call():
+    ops = [
+        get_block_table_ref_torch,
+        get_block_table_ref_triton,
+        get_block_table_ref_triton_v2,
+    ]
+    if torch.cuda.is_available():
+        ops.append(sparse_kernel_extension.get_block_table_v2)
+        ops.append(sparse_kernel_extension.get_block_table_v3)
+
+    return ops
 
 
-def test_v3_matches_v1(test_data):
-    out_v1 = sparse_kernel_extension.get_block_table_v1(
-        test_data["topk_idx"],
-        test_data["block_table"],
-        test_data["token_to_bs"],
-        test_data["seqlen_q"],
-        test_data["seqlen_q"],
-        kSparseTopK,
-    )
-    out_v3 = sparse_kernel_extension.get_block_table_v3(
-        test_data["topk_idx"],
-        test_data["block_table"],
-        test_data["token_to_bs"],
-        test_data["seqlen_q"],
-        test_data["seqlen_q"],
-        kSparseTopK,
-    )
-    assert torch.allclose(out_v1, out_v3), "v3 output differs from v1"
-
-
-def test_torch_matches_v1(test_data):
-    out_v1 = sparse_kernel_extension.get_block_table_v1(
-        test_data["topk_idx"],
-        test_data["block_table"],
-        test_data["token_to_bs"],
-        test_data["seqlen_q"],
-        test_data["seqlen_q"],
-        kSparseTopK,
-    )
-    out_torch = get_block_table_ref_torch(
-        test_data["topk_idx"],
-        test_data["block_table"],
-        test_data["token_to_bs"],
-        test_data["seqlen_q"],
-        test_data["seqlen_q"],
-    )
-    assert torch.allclose(out_v1, out_torch), "Torch output differs from v1"
-
-
+@pytest.mark.parametrize("ops_call", ops_call())
 @pytest.mark.parametrize(
     "batch, seq_len, topk",
     [
@@ -200,7 +161,7 @@ def test_torch_matches_v1(test_data):
         (2, 8192, 96),
     ],
 )
-def test_triton_matches_v1(batch, seq_len, topk, device):
+def test_get_block_table_matches_v1(batch, seq_len, topk, device, ops_call):
     data = generate_data(batch, seq_len, topk, device, 0)
     out_v1 = sparse_kernel_extension.get_block_table_v1(
         data["topk_idx"],
@@ -210,7 +171,7 @@ def test_triton_matches_v1(batch, seq_len, topk, device):
         data["seqlen_q"],
         data["topk_val"],
     )
-    out_triton = get_block_table_ref_triton(
+    out_triton = ops_call(
         data["topk_idx"],
         data["block_table"],
         data["token_to_bs"],
@@ -218,6 +179,8 @@ def test_triton_matches_v1(batch, seq_len, topk, device):
         data["seqlen_q"],
         data["topk_val"],
     )
+    assert out_triton.shape is not None
+    assert torch.all(torch.isfinite(out_triton)), "Triton output contains NaN"
     assert torch.allclose(out_v1, out_triton), "Triton output differs from v1"
 
 
@@ -235,13 +198,14 @@ def test_bench_get_table_triton(device):
             ],
             x_log=True,  # x axis is logarithmic.
             line_arg="provider",  # Argument name whose value corresponds to a different line in the plot.
-            line_vals=["torch", "cuda", "cuda2", "cuda3", "triton"],
+            line_vals=["torch", "cuda", "cuda2", "cuda3", "triton", "triton_v2"],
             line_names=[
                 "Torch(ms)",
                 "CUDA v1(ms)",
                 "CUDA v2(ms)",
                 "CUDA v3(ms)",
                 "Triton(ms)",
+                "Triton v2(ms)",
             ],
             styles=[
                 ("blue", "-"),
@@ -249,6 +213,7 @@ def test_bench_get_table_triton(device):
                 ("red", "-"),
                 ("yellow", "-"),
                 ("orange", "-"),
+                ("purple", "-"),
             ],
             ylabel="Latency (ms)",  # Label name for the y-axis.
             plot_name="Performance【get_block_table】",  # Name for the plot. Used also as a file name for saving the plot.
@@ -273,6 +238,13 @@ def test_bench_get_table_triton(device):
         elif provider == "triton":
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: get_block_table_ref_triton(
+                    topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q
+                ),
+                quantiles=quantiles,
+            )
+        elif provider == "triton_v2":
+            ms, min_ms, max_ms = triton.testing.do_bench(
+                lambda: get_block_table_ref_triton_v2(
                     topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q
                 ),
                 quantiles=quantiles,
