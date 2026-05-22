@@ -1,8 +1,5 @@
 import torch
 
-kHeadGroup = 2
-kSparseBlockSize = 64
-
 
 def get_block_table_ref_torch(
     topk_idx: torch.Tensor,
@@ -12,14 +9,18 @@ def get_block_table_ref_torch(
     seqlen_q: torch.Tensor,
     topk=None,
 ):
+    kHeadGroup = 2
+    kSparseBlockSize = 64
+
     H, T, K = topk_idx.shape
-    S = kSparseBlockSize
     L = block_table.size(1)
 
-    offsets = torch.arange(S, device=topk_idx.device, dtype=topk_idx.dtype)
-    pos = topk_idx.unsqueeze(-1) * S + offsets
-    neg_flat = (pos < 0).reshape(H, T, K * S)
-    pos_flat = pos.reshape(H, T, K * S)
+    offsets = torch.arange(
+        kSparseBlockSize, device=topk_idx.device, dtype=topk_idx.dtype
+    )
+    pos = topk_idx.unsqueeze(-1) * kSparseBlockSize + offsets
+    neg_flat = (pos < 0).reshape(H, T, K * kSparseBlockSize)
+    pos_flat = pos.reshape(H, T, K * kSparseBlockSize)
 
     bs = token_to_bs
     seqlen = seqlen_q.expand_as(bs) if seqlen_q.numel() == 1 else seqlen_q[bs]

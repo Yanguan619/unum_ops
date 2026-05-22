@@ -2,9 +2,6 @@ import torch
 import triton
 import triton.language as tl
 
-kHeadGroup = 2
-kSparseBlockSize = 64
-
 
 @triton.jit
 def get_block_table_kernel(
@@ -78,8 +75,9 @@ def get_block_table_ref_triton(
     seqlen_q: torch.Tensor,
     topk=None,
 ):
+    kSparseBlockSize = 64
+
     H, T, K = topk_idx.shape
-    S = kSparseBlockSize
     batch_size = block_table.size(0)
 
     if topk is not None:
@@ -90,7 +88,9 @@ def get_block_table_ref_triton(
     if seqlen_q.numel() == 1:
         seqlen_q = seqlen_q.expand(batch_size).contiguous()
 
-    out = torch.zeros(T, H, K * S, dtype=torch.int32, device=topk_idx.device)
+    out = torch.zeros(
+        T, H, K * kSparseBlockSize, dtype=torch.int32, device=topk_idx.device
+    )
 
     grid = (T * H * K,)
     get_block_table_kernel[grid](
@@ -109,7 +109,7 @@ def get_block_table_ref_triton(
         block_table.size(1),
         T,
         HEAD_GROUP=H,
-        SPARSE_BLOCK_SIZE=S,
+        SPARSE_BLOCK_SIZE=kSparseBlockSize,
         SPARSE_TOPK=K,
     )
 
