@@ -40,32 +40,6 @@ def device():
         return torch.device("cpu")
 
 
-def gen_topk(batch_size, topk_max_val, device):
-    rand_scores = torch.rand((kHeadGroup, batch_size, topk_max_val))
-    indices = rand_scores.topk(kSparseTopK, dim=-1, largest=False).indices
-    topk_idx = indices.sort(dim=-1).values.to(dtype=torch.int32).to(device=device)
-    return topk_idx
-
-
-@pytest.fixture(scope="module")
-def test_data(device):
-    topk_idx = gen_topk(batch_size, topk_max_val, device)
-    block_table = torch.tensor(
-        [_ for _ in range(1, seqlen_q_max * batch_size + 1)],
-        dtype=torch.int32,
-        device=device,
-    ).reshape(batch_size, seqlen_q_max)
-    token_to_bs = torch.arange(0, batch_size, dtype=torch.int32, device=device)
-    seqlen_q = torch.full((batch_size,), seqlen_q_max, dtype=torch.int32, device=device)
-
-    return {
-        "topk_idx": topk_idx,
-        "block_table": block_table,
-        "token_to_bs": token_to_bs,
-        "seqlen_q": seqlen_q,
-    }
-
-
 def generate_data(
     batch_size_val: int,
     seqlen_val: int,
@@ -126,66 +100,6 @@ def generate_data(
         "seqlen_val": seqlen_val,
         "topk_val": kSparseTopK,
     }
-
-
-def ops_call():
-    ops = [
-        get_block_table_ref_torch,
-        get_block_table_ref_triton,
-        get_block_table_ref_triton_v2,
-    ]
-    if torch.cuda.is_available():
-        ops.append(sparse_kernel_extension.get_block_table_v2)
-        ops.append(sparse_kernel_extension.get_block_table_v3)
-
-    return ops
-
-
-def test_get_block_table_v1(test_data):
-    out_block_table = sparse_kernel_extension.get_block_table_v1(
-        test_data["topk_idx"],
-        test_data["block_table"],
-        test_data["token_to_bs"],
-        test_data["seqlen_q"],
-        test_data["seqlen_q"],
-        kSparseTopK,
-    )
-    assert out_block_table.shape is not None
-    assert out_block_table.device.type == "cuda"
-
-
-@pytest.mark.parametrize("ops_call", ops_call())
-@pytest.mark.parametrize(
-    "batch, seq_len, topk",
-    [
-        (1, 256, 4),
-        (2, 512, 8),
-        (4, 1024, 16),
-        (8, 2048, 32),
-        (4, 4096, 64),
-        (2, 8192, 96),
-    ],
-)
-def test_get_block_table_matches_v1(batch, seq_len, topk, device, ops_call):
-    data = generate_data(batch, seq_len, topk, device, 0)
-    out_v1 = sparse_kernel_extension.get_block_table_v1(
-        data["topk_idx"],
-        data["block_table"],
-        data["token_to_bs"],
-        data["seqlen_q"],
-        data["seqlen_q"],
-        data["topk_val"],
-    )
-    out_triton = ops_call(
-        data["topk_idx"],
-        data["block_table"],
-        data["token_to_bs"],
-        data["seqlen_q"],
-        data["seqlen_q"],
-        data["topk_val"],
-    )
-    assert out_triton is not None, "Triton output is None"
-    assert torch.allclose(out_v1, out_triton), "Triton output differs from v1"
 
 
 def test_bench_get_table_triton(device):

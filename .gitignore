@@ -1,3 +1,5 @@
+# Python
 .venv
 .benchmarks
+.ruff_cache
 __pycache__

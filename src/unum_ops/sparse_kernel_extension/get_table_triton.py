@@ -104,6 +104,7 @@ def get_block_table_kernel_opt(
 
     if sparse_block_idx < 0:
         return
+
     offsets = tl.arange(0, SPARSE_BLOCK_SIZE)
     token_idx_in_batch = sparse_block_idx * SPARSE_BLOCK_SIZE + offsets
 
