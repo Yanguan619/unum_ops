@@ -8,10 +8,25 @@ def round_multiple(x, m):
     return (x + m - 1) // m * m
 
 
-def infllmv2_attn_stage1_ref_torch(q, k, v, cu_seqlens_q, cu_seqlens_k, causal=False):
-    # 将 varlen 输入转换为 padded 形式
-    # q = q.to(torch.float32)
-    # k = k.to(torch.float32)
+def infllmv2_attn_stage1_ref_torch(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    cu_seqlens_v=None,
+    causal=False,
+    max_seqlen_q=None,
+    max_seqlen_k=None,
+):
+    # Support both layout:
+    #   (n_heads, total_seqlen, head_dim)  — legacy torch layout
+    #   (total_seqlen, n_heads, head_dim)  — cuda/triton layout
+    total_seqlen_q = cu_seqlens_q[-1].item()
+    if q.shape[0] == total_seqlen_q:
+        q = q.transpose(0, 1)
+        k = k.transpose(0, 1)
+        v = v.transpose(0, 1)
     batch_size = len(cu_seqlens_q) - 1
     max_seqlen_q = max(cu_seqlens_q[i + 1] - cu_seqlens_q[i] for i in range(batch_size))
     max_seqlen_k = max(cu_seqlens_k[i + 1] - cu_seqlens_k[i] for i in range(batch_size))

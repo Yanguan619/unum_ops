@@ -1,7 +1,8 @@
-import torch
 import pytest
-from unum_ops.infllm_v2 import max_pooling_1d_varlen_ref_torch
+import torch
 from infllm_v2.max_pooling_1d import max_pooling_1d, max_pooling_1d_varlen
+
+from unum_ops.infllm_v2 import max_pooling_1d_varlen_ref_triton
 
 
 @pytest.mark.parametrize("num_heads", [4, 8, 16])
@@ -73,7 +74,7 @@ def test_varlen_vs_triton(batch_size, num_heads):
     print("\n" + "=" * 60)
     print("Running transform_score (Triton implementation)...")
     print("=" * 60)
-    triton_result = max_pooling_1d_varlen_ref_torch(
+    triton_result = max_pooling_1d_varlen_ref_triton(
         attn_score_full,
         kernel_size,
         kernel_stride,
@@ -163,7 +164,7 @@ def test_varlen_vs_triton(batch_size, num_heads):
                     triton_val = triton_result[h, q, b].item()
                     varlen_val = varlen_result[h, q, b].item()
                     print(
-                        f"  Position [{h}, {q}, {b}]: Triton={triton_val:.6f}, Varlen={varlen_val:.6f}, Diff={abs(triton_val-varlen_val):.6f}"
+                        f"  Position [{h}, {q}, {b}]: Triton={triton_val:.6f}, Varlen={varlen_val:.6f}, Diff={abs(triton_val - varlen_val):.6f}"
                     )
     else:
         print(
@@ -188,9 +189,9 @@ def test_varlen_vs_triton(batch_size, num_heads):
         q_end = cu_seqlens_q[b + 1].item()
         q_len = q_end - q_start
 
-        print(f"\n{'='*50}")
+        print(f"\n{'=' * 50}")
         print(f"Batch {b}: queries [{q_start}:{q_end}], length={q_len}")
-        print(f"{'='*50}")
+        print(f"{'=' * 50}")
 
         # Extract batch data from both results
         triton_batch = triton_result[:, q_start:q_end, :]

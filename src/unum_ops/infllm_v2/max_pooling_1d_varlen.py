@@ -94,7 +94,7 @@ def _transform_score_kernel(
     )
 
 
-def max_pooling_1d_varlen_ref_torch(
+def max_pooling_1d_varlen_ref_triton(
     score: torch.Tensor,
     kernel_size: int,
     kernel_stride: int,

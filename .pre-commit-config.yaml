@@ -31,6 +31,16 @@ repos:
         entry: pytest
         language: system
         pass_filenames: false
-        args: ["-x", "--tb=short"]
+        args: ["test", "-x", "--tb=short"]
+        always_run: true
+        verbose: true
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest-benchmarking
+        entry: pytest
+        language: system
+        pass_filenames: false
+        args: ["benchmark", "-x", "--tb=short"]
         always_run: true
         verbose: true
