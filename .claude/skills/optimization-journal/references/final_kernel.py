@@ -9,7 +9,6 @@ def _next_pow2(n):
     return 1 << (n - 1).bit_length()
 
 
-@triton.heuristics({"BLOCK_Q": lambda args: 64, "PADDING": lambda args: 1})
 @triton.jit
 def _max_pooling_1d_varlen_kernel(
     score_ptr,
@@ -96,6 +95,7 @@ def max_pooling_1d_varlen_ref_triton(
 
     stride_pool = block_size // kernel_stride
     ksize = stride_pool + 1
+    padding = 1
     flat_stride = max_seqlen_q // kernel_stride
 
     block_score = torch.full(
@@ -106,6 +106,7 @@ def max_pooling_1d_varlen_ref_triton(
     )
 
     ksize_pow2 = _next_pow2(ksize)
+    block_q = 64
 
     grid = (num_heads * max_blocks,)
     _max_pooling_1d_varlen_kernel[grid](
@@ -121,8 +122,10 @@ def max_pooling_1d_varlen_ref_triton(
         STRIDE_POOL=stride_pool,
         KSIZE=ksize,
         KSIZE_POW2=ksize_pow2,
+        PADDING=padding,
         INIT_BLOCKS=init_blocks,
         LOCAL_BLOCKS=local_blocks,
+        BLOCK_Q=block_q,
         batch_size=batch_size,
     )
 

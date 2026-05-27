@@ -18,8 +18,7 @@ import pytest
 import torch
 
 
-def data(device="npu:0"):
-    dtype = torch.float16
+def data(device="npu:0", dtype=torch.float16):
     num_q_heads = 32
     num_kv_heads = 2  # 4
     head_dim = 128

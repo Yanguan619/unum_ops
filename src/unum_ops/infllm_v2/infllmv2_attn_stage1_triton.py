@@ -74,7 +74,7 @@ def _infllmv2_attn_stage1_kernel(
         + (head_group * N_HEADS_PER_GROUP + offs_g[:, None]) * stride_q_h
         + offs_d[None, :] * stride_q_d,
     ).to(tl.float32)
-    q_group_fp16 = q_group.to(tl.float16)
+    q_group_bf16 = q_group.to(tl.bfloat16)
 
     # Pass 1: compute per-head stats, vectorized over all heads
     m_all = tl.full([N_HEADS_PER_GROUP], float("-inf"), dtype=tl.float32)
@@ -94,7 +94,10 @@ def _infllmv2_attn_stage1_kernel(
             other=0.0,
         ).to(tl.float32)
 
-        scores_2d = tl.dot(q_group_fp16, k_tile.T.to(tl.float16)) * scale_f32
+        scores_2d = (
+            tl.dot(q_group_bf16, k_tile.T.to(tl.bfloat16)).to(tl.float32) * scale_f32
+        )
+        scores_2d = tl.where(k_mask[None, :], scores_2d, float("-inf"))
 
         if causal:
             causal_mask = (ks_off + tl.arange(0, BLOCK_K)) < q_compress_off
@@ -125,8 +128,10 @@ def _infllmv2_attn_stage1_kernel(
 
         # scores_2d = tl.dot(q_group_fp16, k_tile.T.to(tl.float16)) * scale_f32
         scores_2d = (
-            tl.dot(q_group.to(tl.float16), k_tile.T.to(tl.float16)).to(tl.float32) * scale_f32
+            tl.dot(q_group.to(tl.bfloat16), k_tile.T.to(tl.bfloat16)).to(tl.float32)
+            * scale_f32
         )
+        scores_2d = tl.where(k_mask[None, :], scores_2d, float("-inf"))
 
         if causal:
             causal_mask = (ks_off + tl.arange(0, BLOCK_K)) < q_compress_off
@@ -136,7 +141,10 @@ def _infllmv2_attn_stage1_kernel(
         block_out = tl.sum(softmax_all, axis=0)
 
         tl.store(
-            out_ptr + head_group * stride_out_h + q_pos * stride_out_q + offs_k * stride_out_k,
+            out_ptr
+            + head_group * stride_out_h
+            + q_pos * stride_out_q
+            + offs_k * stride_out_k,
             block_out,
             mask=k_mask,
         )
@@ -161,7 +169,9 @@ def infllmv2_attn_stage1_triton(
     return_attn_probs=True,
     block_table=None,
 ):
-    q, k, v = [x.contiguous() if x is not None and x.stride(-1) != 1 else x for x in (q, k, v)]
+    q, k, v = [
+        x.contiguous() if x is not None and x.stride(-1) != 1 else x for x in (q, k, v)
+    ]
 
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -172,7 +182,9 @@ def infllmv2_attn_stage1_triton(
     batch_size = cu_seqlens_q.numel() - 1
 
     if max_seqlen_k is None or max_seqlen_k == 0:
-        max_seqlen_k = max(int(cu_seqlens_k[i + 1] - cu_seqlens_k[i]) for i in range(batch_size))
+        max_seqlen_k = max(
+            int(cu_seqlens_k[i + 1] - cu_seqlens_k[i]) for i in range(batch_size)
+        )
 
     # Round max_seqlen_k to BLOCK_K boundary for output allocation
     # BLOCK_K is chosen based on max_seqlen_k: larger K length = fewer iterations

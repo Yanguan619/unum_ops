@@ -1,0 +1,26 @@
+{
+  "skill_name": "unum-ops-triton-optimization",
+  "evals": [
+    {
+      "id": 0,
+      "name": "best-configuration-query",
+      "prompt": "I'm looking at the max_pooling_1d_varlen Triton kernel optimization and I need to know: what was the final best configuration? Specifically, what BLOCK_Q and num_warps gave the best performance at seqlen=8192, and what was the final latency compared to the CUDA baseline?",
+      "expected_output": "Must mention BLOCK_Q=64, num_warps=4, final Triton 0.913ms vs CUDA 0.431ms at seqlen=8192 (2.1x gap)",
+      "files": []
+    },
+    {
+      "id": 1,
+      "name": "failed-approaches-query",
+      "prompt": "I'm trying to optimize a different Triton kernel in the same codebase and don't want to repeat failed experiments. Which optimization attempts were tried for max_pooling_1d_varlen but ultimately rejected? I want to know what didn't work and why.",
+      "expected_output": "Must list at least 3 failed attempts (per-key-position loads, per-query-tile layout, num_warps=8, etc.) with reasons for each failure",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "memory-bandwidth-analysis",
+      "prompt": "The max_pooling_1d_varlen Triton kernel is 2.1x slower than CUDA at seqlen=8192. What's the root cause of this gap? I'm particularly interested in the memory access pattern and bandwidth utilization numbers.",
+      "expected_output": "Must explain strided memory access, flat_stride=512 vs tensor stride=16384, ~4.6% HBM bandwidth utilization for Triton vs ~10% for CUDA",
+      "files": []
+    }
+  ]
+}

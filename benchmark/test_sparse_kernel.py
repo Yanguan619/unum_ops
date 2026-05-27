@@ -34,7 +34,7 @@ benchmark_output_dir.mkdir(parents=True, exist_ok=True)
 def device():
     if torch.cuda.is_available():
         return torch.device("cuda:0")
-    elif torch.npu.is_available():
+    elif hasattr(torch, "npu") and torch.npu.is_available():
         return torch.device("npu:0")
     else:
         return torch.device("cpu")

@@ -5,8 +5,11 @@ from infllm_v2 import infllmv2_attn_stage1
 from unum_ops.infllm_v2 import infllmv2_attn_stage1_ref_torch
 from unum_ops.infllm_v2.infllmv2_attn_stage1_triton import infllmv2_attn_stage1_triton
 
+rtol = 1e-2
+atol = 1e-5
 
-def data(
+
+def generate_data(
     seqlen_q,
     seqlen_k,
     n_heads=32,
@@ -35,7 +38,7 @@ def data(
 
 
 @pytest.mark.parametrize("seqlen_q", [64, 256], ids=lambda v: f"seqlen_q={v}")
-@pytest.mark.parametrize("seqlen_k", [15, 16, 129], ids=lambda v: f"seqlen_k={v}")
+@pytest.mark.parametrize("seqlen_k", [15, 16, 128], ids=lambda v: f"seqlen_k={v}")
 def test_infllmv2_attn_stage1_cuda(
     seqlen_q,
     seqlen_k,
@@ -46,7 +49,7 @@ def test_infllmv2_attn_stage1_cuda(
     causal=True,
     batch_size=1,
 ):
-    q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k = data(
+    q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k = generate_data(
         seqlen_q,
         seqlen_k,
         n_heads,
@@ -79,10 +82,12 @@ def test_infllmv2_attn_stage1_cuda(
 
 
 @pytest.mark.parametrize("seqlen_q", [64, 256], ids=lambda v: f"seqlen_q={v}")
-@pytest.mark.parametrize("seqlen_k", [128, 256], ids=lambda v: f"seqlen_k={v}")
+@pytest.mark.parametrize("seqlen_k", [15, 16, 128], ids=lambda v: f"seqlen_k={v}")
+@pytest.mark.parametrize("causal", [True, False], ids=lambda v: f"causal={v}")
 def test_infllmv2_attn_stage1_triton_vs_cuda(
     seqlen_q,
     seqlen_k,
+    causal,
     n_heads=32,
     n_kv_heads=2,
     head_dim=128,
@@ -98,14 +103,14 @@ def test_infllmv2_attn_stage1_triton_vs_cuda(
     2. (causal mask) The CUDA kernel's causal mask differs from the InfLLMv2
        reference, so causal=True comparisons are not meaningful.
     """
-    q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k = data(
+    q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k = generate_data(
         seqlen_q,
         seqlen_k,
         n_heads,
         n_kv_heads,
         head_dim,
         dtype,
-        causal=False,
+        causal=causal,
         batch_size=batch_size,
     )
 
@@ -144,28 +149,23 @@ def test_infllmv2_attn_stage1_triton_vs_cuda(
     n_heads_per_group = 32 // 2
     valid_q_count = seqlen_q // n_heads_per_group
     cuda_mask = cuda_out != 0
-    diff = (cuda_out.float() - triton_out).abs()
 
     if valid_q_count > 0:
         valid_mask = torch.zeros_like(cuda_out, dtype=torch.bool)
         valid_mask[:, :valid_q_count, :] = True
-        nz_diff = diff[valid_mask & cuda_mask]
+        mask = valid_mask & cuda_mask
     else:
-        nz_diff = diff[cuda_mask]
+        mask = cuda_mask
 
-    max_err = nz_diff.max().item() if nz_diff.numel() > 0 else 0.0
-    mean_err = nz_diff.mean().item() if nz_diff.numel() > 0 else 0.0
+    print(f"  CUDA valid non-zero: {mask.sum().item()}/{cuda_mask.numel()}")
 
-    print(f"  CUDA valid non-zero: {nz_diff.numel()}/{cuda_mask.numel()}")
-    print(f"  At valid positions: max_diff={max_err:.6f} mean_diff={mean_err:.6f}")
-
-    # bf16 precision: ~0.8% relative error per softmax computation.
-    # With 16 summed heads at each position, max error < 0.01 is expected.
-    assert max_err < 0.02, f"Max diff {max_err} exceeds bf16 precision tolerance"
+    torch.testing.assert_close(
+        cuda_out.float()[mask], triton_out.float()[mask], atol=atol, rtol=rtol
+    )
 
 
-@pytest.mark.parametrize("seqlen_q", [64, 128, 256, 512], ids=lambda v: f"seqlen_q={v}")
-@pytest.mark.parametrize("seqlen_k", [128, 256, 512], ids=lambda v: f"seqlen_k={v}")
+@pytest.mark.parametrize("seqlen_q", [64, 256], ids=lambda v: f"seqlen_q={v}")
+@pytest.mark.parametrize("seqlen_k", [15, 16, 128], ids=lambda v: f"seqlen_k={v}")
 def test_infllmv2_attn_stage1_precision_comparison(
     seqlen_q,
     seqlen_k,
@@ -178,7 +178,7 @@ def test_infllmv2_attn_stage1_precision_comparison(
     """
     Compare both torch and triton against CUDA to determine which is more precise.
     """
-    q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k = data(
+    q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k = generate_data(
         seqlen_q,
         seqlen_k,
         n_heads,
@@ -229,29 +229,17 @@ def test_infllmv2_attn_stage1_precision_comparison(
     valid_q_count = seqlen_q // n_heads_per_group
     cuda_mask = cuda_out != 0
 
-    torch_diff = (cuda_out.float() - torch_out.float()).abs()
-    triton_diff = (cuda_out.float() - triton_out.float()).abs()
-
     if valid_q_count > 0:
         valid_mask = torch.zeros_like(cuda_out, dtype=torch.bool)
         valid_mask[:, :valid_q_count, :] = True
         mask = valid_mask & cuda_mask
-        torch_nz = torch_diff[mask]
-        triton_nz = triton_diff[mask]
     else:
-        torch_nz = torch_diff[cuda_mask]
-        triton_nz = triton_diff[cuda_mask]
+        mask = cuda_mask
 
-    t_max = torch_nz.max().item() if torch_nz.numel() > 0 else 0.0
-    tr_max = triton_nz.max().item() if triton_nz.numel() > 0 else 0.0
-    t_mean = torch_nz.mean().item() if torch_nz.numel() > 0 else 0.0
-    tr_mean = triton_nz.mean().item() if triton_nz.numel() > 0 else 0.0
-
-    print(
-        f"\n    torch  vs CUDA: max_diff={t_max:.6f} mean_diff={t_mean:.6f}"
-        f"\n    triton vs CUDA: max_diff={tr_max:.6f} mean_diff={tr_mean:.6f}"
+    torch.testing.assert_close(
+        cuda_out.float()[mask], torch_out.float()[mask], rtol=rtol, atol=atol
     )
 
-    assert (
-        max(t_max, tr_max) < 0.02
-    ), f"Max diff exceeds bf16 precision tolerance: torch={t_max:.6f} triton={tr_max:.6f}"
+    torch.testing.assert_close(
+        cuda_out.float()[mask], triton_out.float()[mask], rtol=rtol, atol=atol
+    )

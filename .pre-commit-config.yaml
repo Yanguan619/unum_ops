@@ -41,6 +41,6 @@ repos:
         entry: pytest
         language: system
         pass_filenames: false
-        args: ["benchmark", "-x", "--tb=short"]
+        args: ["benchmark", "-x", "--tb=short", "-sv"]
         always_run: true
         verbose: true

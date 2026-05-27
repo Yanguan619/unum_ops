@@ -1,18 +1,39 @@
 from pathlib import Path
 
+import pytest
 import torch
 import triton
 from infllm_v2 import infllmv2_attn_stage1
 
-from unum_ops.infllm_v2 import infllmv2_attn_stage1_ref_torch, infllmv2_attn_stage1_triton
+from unum_ops.infllm_v2 import (
+    infllmv2_attn_stage1_ref_torch,
+    infllmv2_attn_stage1_triton,
+)
 
 benchmark_output_dir = Path("./benchmark/output/")
 benchmark_output_dir.mkdir(parents=True, exist_ok=True)
 
 
-def test_infllmv2_attn_stage1(
-    head_dim=128, n_heads=32, n_kv_heads=2, dtype=torch.bfloat16, device="cuda"
-) -> None:
+@pytest.fixture(scope="session")
+def device():
+    if torch.cuda.is_available():
+        return torch.device("cuda:0")
+    elif hasattr(torch, "npu") and torch.npu.is_available():
+        return torch.device("npu:0")
+    else:
+        return torch.device("cpu")
+
+
+@pytest.fixture(scope="session")
+def dtype():
+    return torch.bfloat16
+
+
+def test_infllmv2_attn_stage1(dtype, device) -> None:
+    head_dim = 128
+    n_heads = 32
+    n_kv_heads = 2
+
     @triton.testing.perf_report(
         triton.testing.Benchmark(
             x_names=["seqlen_q", "seqlen_k"],

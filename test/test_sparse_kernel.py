@@ -3,7 +3,6 @@ from pathlib import Path
 
 import pytest
 import torch
-import triton
 
 from unum_ops.sparse_kernel_extension import (
     get_block_table_ref_torch,
@@ -13,6 +12,9 @@ from unum_ops.sparse_kernel_extension import (
 
 if torch.cuda.is_available():
     import sparse_kernel_extension
+
+rtol: float = 0.00001
+atol: float = 1e-8
 
 logging.basicConfig(level=logging.DEBUG)
 torch.manual_seed(42)
@@ -185,98 +187,5 @@ def test_get_block_table_matches_v1(batch, seq_len, topk, device, ops_call):
         data["topk_val"],
     )
     assert out_triton is not None, "Triton output is None"
-    assert torch.allclose(out_v1, out_triton), "Triton output differs from v1"
 
-
-def test_bench_get_table_triton(device):
-    @triton.testing.perf_report(
-        triton.testing.Benchmark(
-            x_names=["batch_size", "seq_len", "topk"],
-            x_vals=[
-                (1, 2048, 32),
-                (4, 2048, 32),
-                (16, 2048, 64),
-                (64, 2048, 64),
-                (256, 4096, 96),
-                (256, 8192, 96),
-            ],
-            x_log=True,  # x axis is logarithmic.
-            line_arg="provider",  # Argument name whose value corresponds to a different line in the plot.
-            line_vals=["torch", "cuda", "cuda2", "cuda3", "triton", "triton_v2"],
-            line_names=[
-                "Torch(ms)",
-                "CUDA v1(ms)",
-                "CUDA v2(ms)",
-                "CUDA v3(ms)",
-                "Triton(ms)",
-                "Triton v2(ms)",
-            ],
-            styles=[
-                ("blue", "-"),
-                ("green", "-"),
-                ("red", "-"),
-                ("yellow", "-"),
-                ("orange", "-"),
-                ("purple", "-"),
-            ],
-            ylabel="Latency (ms)",  # Label name for the y-axis.
-            plot_name="Performance_get_block_table",  # Name for the plot. Used also as a file name for saving the plot.
-            args={},  # Values for function arguments not in `x_names` and `y_name`.
-        )
-    )
-    def benchmark(batch_size: int, seq_len: int, topk: int, provider):
-        data = generate_data(batch_size, seq_len, topk, device, 0)
-        topk_idx = data["topk_idx"]
-        block_table = data["block_table"]
-        token_to_bs = data["token_to_bs"]
-        seqlen_q = data["seqlen_q"]
-
-        quantiles = [0.5, 0.2, 0.8]
-        if provider == "torch":
-            ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: get_block_table_ref_torch(
-                    topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q
-                ),
-                quantiles=quantiles,
-            )
-        elif provider == "triton":
-            ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: get_block_table_ref_triton(
-                    topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q
-                ),
-                quantiles=quantiles,
-            )
-        elif provider == "triton_v2":
-            ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: get_block_table_ref_triton_v2(
-                    topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q
-                ),
-                quantiles=quantiles,
-            )
-        elif provider == "cuda":
-            ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: sparse_kernel_extension.get_block_table_v1(
-                    topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q, kSparseTopK
-                ),
-                quantiles=quantiles,
-            )
-        elif provider == "cuda2":
-            ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: sparse_kernel_extension.get_block_table_v2(
-                    topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q, kSparseTopK
-                ),
-                quantiles=quantiles,
-            )
-        elif provider == "cuda3":
-            ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: sparse_kernel_extension.get_block_table_v3(
-                    topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q, kSparseTopK
-                ),
-                quantiles=quantiles,
-            )
-        else:
-            raise ValueError(f"Unknown provider: {provider}")
-
-        return ms, min_ms, max_ms
-
-    benchmark.run(print_data=True, show_plots=False, save_path=benchmark_output_dir)
+    torch.testing.assert_close(out_v1, out_triton, rtol=rtol, atol=atol)

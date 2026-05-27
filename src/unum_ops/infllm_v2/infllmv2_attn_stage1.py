@@ -63,12 +63,20 @@ def infllmv2_attn_stage1_ref_torch(
         k_padded[:, i, : k_end - k_start] = k[:, k_start:k_end]
         # v_padded[:, i, :k_end-k_start] = v[:, k_start:k_end]
 
-    # 计算 attention
+    # 计算 attention (全部在 float32 中进行，与 CUDA kernel 内部精度对齐)
     k_padded = k_padded.repeat_interleave(q_padded.shape[0] // k_padded.shape[0], dim=0)
     # v_padded = v_padded.repeat_interleave(q_padded.shape[0] // v_padded.shape[0], dim=0)
 
+    q_padded = q_padded.float()
+    k_padded = k_padded.float()
+
     scale = 1.0 / math.sqrt(q_padded.size(-1))
     attn = q_padded @ k_padded.transpose(-2, -1) * scale
+
+    for i in range(batch_size):
+        k_len_actual = cu_seqlens_k[i + 1] - cu_seqlens_k[i]
+        if k_len_actual < max_seqlen_k:
+            attn[:, i, :, k_len_actual:] = -float("inf")
 
     if causal:
         q_len = max_seqlen_q
@@ -80,19 +88,8 @@ def infllmv2_attn_stage1_ref_torch(
             [0] * q_compress_idx[i] + [1] * (k_len - q_compress_idx[i])
             for i in range(q_len)
         ]
-        # breakpoint()
         mask = torch.tensor(mask, dtype=torch.bool, device=attn.device)
         causal_mask = mask.expand(batch_size, q_len, k_len)
-        # print(mask)
-        # breakpoint()
-        # score = S.masked_fill(mask, float('-inf'))
-        # causal_mask = torch.zeros(batch_size, max_seqlen_q, max_seqlen_k, device=q.device).bool()
-        # for b in range(batch_size):
-        #     for i in range(max_seqlen_q):
-        #         for j in range(max_seqlen_k):
-        #             # i + 1 - 32 / 16 = j? (i + 1) / 16 - 1 = j i + 1 = 16 j + 16 ?
-        #             if i >= (j * 16 + 32 - 1):
-        #                 causal_mask[b, i, j] = True
         attn = attn.masked_fill(causal_mask, -float("inf"))
 
     score = F.softmax(attn, dim=-1)

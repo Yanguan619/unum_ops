@@ -1,0 +1,23 @@
+{
+    "folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../infllmv2_cuda_impl"
+		},
+		{
+			"path": "../sparse_kernel"
+		},
+		{
+			"path": "../sglang"
+		},
+		{
+			"path": "../sglang-ori"
+		},
+		{
+			"path": "../FlagGems"
+		}
+	],
+    "settings": {}
+}
