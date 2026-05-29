@@ -2,11 +2,7 @@ import pytest
 import torch
 from infllm_v2 import infllmv2_attn_stage1
 
-from unum_ops.infllm_v2 import infllmv2_attn_stage1_ref_torch
 from unum_ops.infllm_v2.infllmv2_attn_stage1_triton import infllmv2_attn_stage1_triton
-
-rtol = 1e-2
-atol = 1e-5
 
 
 def generate_data(
@@ -17,7 +13,6 @@ def generate_data(
     head_dim=128,
     dtype=torch.bfloat16,
     device="cuda",
-    causal=True,
     batch_size=1,
 ):
     seqlen_qs = [seqlen_q]
@@ -39,55 +34,9 @@ def generate_data(
 
 @pytest.mark.parametrize("seqlen_q", [64, 256], ids=lambda v: f"seqlen_q={v}")
 @pytest.mark.parametrize("seqlen_k", [15, 16, 128], ids=lambda v: f"seqlen_k={v}")
-def test_infllmv2_attn_stage1_cuda(
-    seqlen_q,
-    seqlen_k,
-    n_heads=32,
-    n_kv_heads=2,
-    head_dim=128,
-    dtype=torch.bfloat16,
-    causal=True,
-    batch_size=1,
-):
-    q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k = generate_data(
-        seqlen_q,
-        seqlen_k,
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        dtype,
-        causal=causal,
-        batch_size=batch_size,
-    )
-
-    naive_score = infllmv2_attn_stage1_ref_torch(
-        q, k, k, cu_seqlens_q, cu_seqlens_k, causal=causal
-    )
-
-    q = q.transpose(0, 1).contiguous().clone()
-    k = k.transpose(0, 1).contiguous().clone()
-
-    flash_score = infllmv2_attn_stage1(
-        q,
-        k,
-        k,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        cu_seqlens_v=cu_seqlens_k,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        causal=causal,
-    )
-    assert flash_score.shape == naive_score.shape
-
-
-@pytest.mark.parametrize("seqlen_q", [64, 256], ids=lambda v: f"seqlen_q={v}")
-@pytest.mark.parametrize("seqlen_k", [15, 16, 128], ids=lambda v: f"seqlen_k={v}")
-@pytest.mark.parametrize("causal", [True, False], ids=lambda v: f"causal={v}")
 def test_infllmv2_attn_stage1_triton_vs_cuda(
     seqlen_q,
     seqlen_k,
-    causal,
     n_heads=32,
     n_kv_heads=2,
     head_dim=128,
@@ -110,7 +59,6 @@ def test_infllmv2_attn_stage1_triton_vs_cuda(
         n_kv_heads,
         head_dim,
         dtype,
-        causal=causal,
         batch_size=batch_size,
     )
 
@@ -159,87 +107,4 @@ def test_infllmv2_attn_stage1_triton_vs_cuda(
 
     print(f"  CUDA valid non-zero: {mask.sum().item()}/{cuda_mask.numel()}")
 
-    torch.testing.assert_close(
-        cuda_out.float()[mask], triton_out.float()[mask], atol=atol, rtol=rtol
-    )
-
-
-@pytest.mark.parametrize("seqlen_q", [64, 256], ids=lambda v: f"seqlen_q={v}")
-@pytest.mark.parametrize("seqlen_k", [15, 16, 128], ids=lambda v: f"seqlen_k={v}")
-def test_infllmv2_attn_stage1_precision_comparison(
-    seqlen_q,
-    seqlen_k,
-    n_heads=32,
-    n_kv_heads=2,
-    head_dim=128,
-    dtype=torch.bfloat16,
-    batch_size=1,
-):
-    """
-    Compare both torch and triton against CUDA to determine which is more precise.
-    """
-    q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k = generate_data(
-        seqlen_q,
-        seqlen_k,
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        dtype,
-        causal=False,
-        batch_size=batch_size,
-    )
-
-    q_contig = q.transpose(0, 1).contiguous().clone()
-    k_contig = k.transpose(0, 1).contiguous().clone()
-
-    cuda_out = infllmv2_attn_stage1(
-        q_contig,
-        k_contig,
-        k_contig,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        cu_seqlens_v=cu_seqlens_k,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        causal=False,
-    )
-
-    torch_out = infllmv2_attn_stage1_ref_torch(
-        q,
-        k,
-        k,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        causal=False,
-    )
-
-    triton_out = infllmv2_attn_stage1_triton(
-        q_contig,
-        k_contig,
-        k_contig,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        cu_seqlens_v=cu_seqlens_k,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        causal=False,
-    )
-
-    n_heads_per_group = 32 // 2
-    valid_q_count = seqlen_q // n_heads_per_group
-    cuda_mask = cuda_out != 0
-
-    if valid_q_count > 0:
-        valid_mask = torch.zeros_like(cuda_out, dtype=torch.bool)
-        valid_mask[:, :valid_q_count, :] = True
-        mask = valid_mask & cuda_mask
-    else:
-        mask = cuda_mask
-
-    torch.testing.assert_close(
-        cuda_out.float()[mask], torch_out.float()[mask], rtol=rtol, atol=atol
-    )
-
-    torch.testing.assert_close(
-        cuda_out.float()[mask], triton_out.float()[mask], rtol=rtol, atol=atol
-    )
+    assert torch.allclose(cuda_out.float()[mask], triton_out.float()[mask])

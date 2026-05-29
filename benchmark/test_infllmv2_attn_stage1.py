@@ -6,8 +6,8 @@ import triton
 from infllm_v2 import infllmv2_attn_stage1
 
 from unum_ops.infllm_v2 import (
-    infllmv2_attn_stage1_ref_torch,
     infllmv2_attn_stage1_triton,
+    infllmv2_attn_stage1_triton_v2,
 )
 
 benchmark_output_dir = Path("./benchmark/output/")
@@ -49,11 +49,11 @@ def test_infllmv2_attn_stage1(dtype, device) -> None:
             ],
             x_log=True,  # x axis is logarithmic.
             line_arg="provider",  # Argument name whose value corresponds to a different line in the plot.
-            line_vals=["torch", "cuda", "triton"],
+            line_vals=["cuda", "triton", "triton_v2"],
             line_names=[
-                "Torch(ms)",
                 "CUDA(ms)",
                 "Triton(ms)",
+                "Triton_v2(ms)",
             ],
             styles=[
                 ("green", "-"),
@@ -74,9 +74,9 @@ def test_infllmv2_attn_stage1(dtype, device) -> None:
         k = k.clone()
         v = k.clone()
         call_ops = {
-            "torch": infllmv2_attn_stage1_ref_torch,
             "cuda": infllmv2_attn_stage1,
             "triton": infllmv2_attn_stage1_triton,
+            "triton_v2": infllmv2_attn_stage1_triton_v2,
         }
         quantiles = [0.5, 0.2, 0.8]
         ms, min_ms, max_ms = triton.testing.do_bench(

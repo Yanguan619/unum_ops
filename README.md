@@ -1,5 +1,7 @@
 # unum_ops
 
+此项目算子全部为triton实现，标杆为cuda实现，目的是为了用triton实现的算子替换cuda实现的算子以适配多种硬件。
+
 ## Modules
 
 ### infllm_v2

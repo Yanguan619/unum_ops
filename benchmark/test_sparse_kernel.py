@@ -9,6 +9,7 @@ from unum_ops.sparse_kernel_extension import (
     get_block_table_ref_torch,
     get_block_table_ref_triton,
     get_block_table_ref_triton_v2,
+    get_block_table_ref_triton_v3,
 )
 
 if torch.cuda.is_available():
@@ -116,7 +117,15 @@ def test_bench_get_table_triton(device):
             ],
             x_log=True,  # x axis is logarithmic.
             line_arg="provider",  # Argument name whose value corresponds to a different line in the plot.
-            line_vals=["torch", "cuda", "cuda2", "cuda3", "triton", "triton_v2"],
+            line_vals=[
+                "torch",
+                "cuda",
+                "cuda2",
+                "cuda3",
+                "triton",
+                "triton_v2",
+                "triton_v3",
+            ],
             line_names=[
                 "Torch(ms)",
                 "CUDA v1(ms)",
@@ -124,6 +133,7 @@ def test_bench_get_table_triton(device):
                 "CUDA v3(ms)",
                 "Triton(ms)",
                 "Triton v2(ms)",
+                "Triton v3(ms)",
             ],
             styles=[
                 ("blue", "-"),
@@ -132,6 +142,7 @@ def test_bench_get_table_triton(device):
                 ("yellow", "-"),
                 ("orange", "-"),
                 ("purple", "-"),
+                ("brown", "-"),
             ],
             ylabel="Latency (ms)",  # Label name for the y-axis.
             plot_name="Performance_get_block_table",  # Name for the plot. Used also as a file name for saving the plot.
@@ -163,6 +174,13 @@ def test_bench_get_table_triton(device):
         elif provider == "triton_v2":
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: get_block_table_ref_triton_v2(
+                    topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q
+                ),
+                quantiles=quantiles,
+            )
+        elif provider == "triton_v3":
+            ms, min_ms, max_ms = triton.testing.do_bench(
+                lambda: get_block_table_ref_triton_v3(
                     topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q
                 ),
                 quantiles=quantiles,

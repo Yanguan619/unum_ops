@@ -4,17 +4,14 @@ from infllm_v2.max_pooling_1d import max_pooling_1d, max_pooling_1d_varlen
 
 from unum_ops.infllm_v2 import max_pooling_1d_varlen_ref_triton
 
-rtol = 0.00001
-atol = 1e-8
-
 
 @pytest.mark.parametrize("num_heads", [4, 8, 16])
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
 def test_varlen_vs_triton(batch_size, num_heads):
+    """Test varlen max pooling against triton transform_score with multi-batch data"""
     # 根据 batch_size 动态生成序列长度
     seqlen_qs = [8 + i * 8 for i in range(batch_size)]
     seqlen_ks = [16 + i * 8 for i in range(batch_size)]
-    """Test varlen max pooling against triton transform_score with multi-batch data"""
     # Load data from multibatch directory
     # data_dir = "/user/qiqi/tmp/multibatch"
 
@@ -110,7 +107,7 @@ def test_varlen_vs_triton(batch_size, num_heads):
     print(f"Varlen result shape: {varlen_result.shape}")
     # 3. Compare results
     print("Comparing varlen results with Triton...")
-    torch.testing.assert_close(triton_result, varlen_result, rtol=rtol, atol=atol)
+    assert torch.allclose(triton_result, varlen_result)
     # Both should have the same shape
     assert (
         triton_result.shape == varlen_result.shape

@@ -8,13 +8,8 @@ from unum_ops.sparse_kernel_extension import (
     get_block_table_ref_torch,
     get_block_table_ref_triton,
     get_block_table_ref_triton_v2,
+    get_block_table_ref_triton_v3,
 )
-
-if torch.cuda.is_available():
-    import sparse_kernel_extension
-
-rtol: float = 0.00001
-atol: float = 1e-8
 
 logging.basicConfig(level=logging.DEBUG)
 torch.manual_seed(42)
@@ -135,15 +130,21 @@ def ops_call():
         get_block_table_ref_torch,
         get_block_table_ref_triton,
         get_block_table_ref_triton_v2,
+        get_block_table_ref_triton_v3,
     ]
     if torch.cuda.is_available():
+        import sparse_kernel_extension
+
         ops.append(sparse_kernel_extension.get_block_table_v2)
         ops.append(sparse_kernel_extension.get_block_table_v3)
 
     return ops
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="cuda not available")
 def test_get_block_table_v1(test_data):
+    import sparse_kernel_extension
+
     out_block_table = sparse_kernel_extension.get_block_table_v1(
         test_data["topk_idx"],
         test_data["block_table"],
@@ -152,10 +153,11 @@ def test_get_block_table_v1(test_data):
         test_data["seqlen_q"],
         kSparseTopK,
     )
-    assert out_block_table.shape is not None
     assert out_block_table.device.type == "cuda"
+    assert out_block_table.shape is not None
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="cuda not available")
 @pytest.mark.parametrize("ops_call", ops_call())
 @pytest.mark.parametrize(
     "batch, seq_len, topk",
@@ -169,6 +171,8 @@ def test_get_block_table_v1(test_data):
     ],
 )
 def test_get_block_table_matches_v1(batch, seq_len, topk, device, ops_call):
+    import sparse_kernel_extension
+
     data = generate_data(batch, seq_len, topk, device, 0)
     out_v1 = sparse_kernel_extension.get_block_table_v1(
         data["topk_idx"],
@@ -188,4 +192,4 @@ def test_get_block_table_matches_v1(batch, seq_len, topk, device, ops_call):
     )
     assert out_triton is not None, "Triton output is None"
 
-    torch.testing.assert_close(out_v1, out_triton, rtol=rtol, atol=atol)
+    assert torch.allclose(out_v1, out_triton)

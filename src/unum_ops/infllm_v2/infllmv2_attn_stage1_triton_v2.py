@@ -7,6 +7,15 @@ def round_multiple(x, m):
     return (x + m - 1) // m * m
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_K": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_K": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_K": 128}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_K": 256}, num_warps=8, num_stages=2),
+    ],
+    key=["max_seqlen_k"],
+)
 @triton.jit
 def _infllmv2_attn_stage1_kernel(
     q_ptr,
@@ -25,6 +34,7 @@ def _infllmv2_attn_stage1_kernel(
     stride_out_k,
     total_q,
     num_batches,
+    max_seqlen_k,
     HEAD_DIM: tl.constexpr,
     N_HEADS: tl.constexpr,
     N_KV_HEADS: tl.constexpr,
@@ -67,16 +77,13 @@ def _infllmv2_attn_stage1_kernel(
     offs_d = tl.arange(0, HEAD_DIM)
     offs_g = tl.arange(0, N_HEADS_PER_GROUP)
 
-    # Pre-load all Q values in one 2D tile [N_HEADS_PER_GROUP, HEAD_DIM]
-    q_group = tl.load(
+    q_group_bf16 = tl.load(
         q_ptr
         + q_pos * stride_q_t
         + (head_group * N_HEADS_PER_GROUP + offs_g[:, None]) * stride_q_h
         + offs_d[None, :] * stride_q_d,
-    ).to(tl.float32)
-    q_group_bf16 = q_group.to(tl.bfloat16)
+    ).to(tl.bfloat16)
 
-    # Pass 1: compute per-head stats, vectorized over all heads
     m_all = tl.full([N_HEADS_PER_GROUP], float("-inf"), dtype=tl.float32)
     se_all = tl.zeros([N_HEADS_PER_GROUP], dtype=tl.float32)
 
@@ -85,17 +92,18 @@ def _infllmv2_attn_stage1_kernel(
         offs_k = ks_off + tl.arange(0, BLOCK_K)
         k_mask = offs_k < k_len
 
-        k_tile = tl.load(
+        k_tile_bf16 = tl.load(
             k_ptr
             + (k_start + offs_k[:, None]) * stride_k_t
             + head_group * stride_k_h
             + offs_d[None, :] * stride_k_d,
             mask=k_mask[:, None],
             other=0.0,
-        ).to(tl.float32)
+            eviction_policy="evict_last",
+        ).to(tl.bfloat16)
 
         scores_2d = (
-            tl.dot(q_group_bf16, k_tile.T.to(tl.bfloat16)).to(tl.float32) * scale_f32
+            tl.dot(q_group_bf16, tl.trans(k_tile_bf16)).to(tl.float32) * scale_f32
         )
         scores_2d = tl.where(k_mask[None, :], scores_2d, float("-inf"))
 
@@ -109,27 +117,26 @@ def _infllmv2_attn_stage1_kernel(
         block_sum = tl.sum(exp_scores, axis=1)
         new_se = se_all * tl.exp(m_all - new_m) + block_sum
 
-        m_all, se_all = new_m, new_se
+        m_all = new_m
+        se_all = new_se
 
-    # Pass 2: compute output, vectorized over all heads
     for bi in range(n_blocks):
         ks_off = bi * BLOCK_K
         offs_k = ks_off + tl.arange(0, BLOCK_K)
         k_mask = offs_k < k_len
 
-        k_tile = tl.load(
+        k_tile_bf16 = tl.load(
             k_ptr
             + (k_start + offs_k[:, None]) * stride_k_t
             + head_group * stride_k_h
             + offs_d[None, :] * stride_k_d,
             mask=k_mask[:, None],
             other=0.0,
-        ).to(tl.float32)
+            eviction_policy="evict_first",
+        ).to(tl.bfloat16)
 
-        # scores_2d = tl.dot(q_group_fp16, k_tile.T.to(tl.float16)) * scale_f32
         scores_2d = (
-            tl.dot(q_group.to(tl.bfloat16), k_tile.T.to(tl.bfloat16)).to(tl.float32)
-            * scale_f32
+            tl.dot(q_group_bf16, tl.trans(k_tile_bf16)).to(tl.float32) * scale_f32
         )
         scores_2d = tl.where(k_mask[None, :], scores_2d, float("-inf"))
 
@@ -150,7 +157,7 @@ def _infllmv2_attn_stage1_kernel(
         )
 
 
-def infllmv2_attn_stage1_triton(
+def infllmv2_attn_stage1_triton_v2(
     q,
     k,
     v,
@@ -186,11 +193,10 @@ def infllmv2_attn_stage1_triton(
             int(cu_seqlens_k[i + 1] - cu_seqlens_k[i]) for i in range(batch_size)
         )
 
-    # Round max_seqlen_k to BLOCK_K boundary for output allocation
-    # BLOCK_K is chosen based on max_seqlen_k: larger K length = fewer iterations
-    BLOCK_K = 128
-
-    max_k_rounded = round_multiple(max_seqlen_k, BLOCK_K) if max_seqlen_k > 0 else 0
+    round_block_k = 128
+    max_k_rounded = (
+        round_multiple(max_seqlen_k, round_block_k) if max_seqlen_k > 0 else 0
+    )
 
     out = torch.zeros(
         n_kv_heads,
@@ -222,11 +228,11 @@ def infllmv2_attn_stage1_triton(
         out.stride(2),
         total_q,
         batch_size,
+        max_seqlen_k,
         HEAD_DIM=head_dim,
         N_HEADS=n_heads,
         N_KV_HEADS=n_kv_heads,
         N_HEADS_PER_GROUP=n_heads_per_group,
-        BLOCK_K=BLOCK_K,
         causal=causal,
         scale_f32=softmax_scale,
     )

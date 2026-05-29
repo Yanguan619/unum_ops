@@ -9,7 +9,18 @@ def _next_pow2(n):
     return 1 << (n - 1).bit_length()
 
 
-@triton.heuristics({"BLOCK_Q": lambda args: 64, "PADDING": lambda args: 1})
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_Q": 32, "BLOCK_BK": 4}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_Q": 64, "BLOCK_BK": 4}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_Q": 64, "BLOCK_BK": 2}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_Q": 32, "BLOCK_BK": 8}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_Q": 16, "BLOCK_BK": 8}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_Q": 32, "BLOCK_BK": 4}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_Q": 64, "BLOCK_BK": 4}, num_warps=8, num_stages=2),
+    ],
+    key=["total_q", "max_blocks"],
+)
 @triton.jit
 def _max_pooling_1d_varlen_kernel(
     score_ptr,
@@ -28,54 +39,82 @@ def _max_pooling_1d_varlen_kernel(
     INIT_BLOCKS: tl.constexpr,
     LOCAL_BLOCKS: tl.constexpr,
     BLOCK_Q: tl.constexpr,
+    BLOCK_BK: tl.constexpr,
     batch_size,
 ):
-    pid = tl.program_id(0)
-    head = pid // max_blocks
-    bk = pid % max_blocks
+    pid_head = tl.program_id(0)
+    pid_q = tl.program_id(1)
+    pid_bk = tl.program_id(2)
+
+    q_start = pid_q * BLOCK_Q
+    bk_start = pid_bk * BLOCK_BK
 
     offs_q = tl.arange(0, BLOCK_Q)
-    offs_k = tl.arange(0, KSIZE_POW2)
+    q_abs = q_start + offs_q
+    q_mask = q_abs < total_q
 
-    for q_start in range(0, total_q, BLOCK_Q):
-        q_abs = q_start + offs_q
-        q_mask = q_abs < total_q
+    offs_bk = tl.arange(0, BLOCK_BK)
+    bk_vals = bk_start + offs_bk
+    bk_mask = bk_vals < max_blocks
 
-        k_len = tl.zeros([BLOCK_Q], dtype=tl.int32)
-        off_bq = tl.zeros([BLOCK_Q], dtype=tl.int32)
-        for b in range(batch_size):
-            qs = tl.load(cu_seqlens_q_ptr + b)
-            qe = tl.load(cu_seqlens_q_ptr + b + 1)
-            ks = tl.load(cu_seqlens_k_ptr + b)
-            ke = tl.load(cu_seqlens_k_ptr + b + 1)
-            hit = (q_abs >= qs) & (q_abs < qe)
-            k_len = tl.where(hit, ke - ks, k_len)
-            off_bq = tl.where(hit, (q_abs - qs) // BLOCK_SIZE, off_bq)
+    k_len = tl.zeros([BLOCK_Q], dtype=tl.int32)
+    off_bq = tl.zeros([BLOCK_Q], dtype=tl.int32)
 
-        base = head * total_q * flat_stride + q_abs * flat_stride
+    for b in range(batch_size):
+        qs = tl.load(cu_seqlens_q_ptr + b)
+        qe = tl.load(cu_seqlens_q_ptr + b + 1)
+        ks = tl.load(cu_seqlens_k_ptr + b)
+        ke = tl.load(cu_seqlens_k_ptr + b + 1)
+        hit = (q_abs >= qs) & (q_abs < qe)
+        k_len = tl.where(hit, ke - ks, k_len)
+        off_bq = tl.where(hit, (q_abs - qs) // BLOCK_SIZE, off_bq)
 
-        should_mask_inf = (bk < INIT_BLOCKS) | (
-            (off_bq >= bk) & (off_bq <= bk + LOCAL_BLOCKS)
+    base_q = pid_head * total_q * flat_stride + q_abs * flat_stride
+
+    win_start_val = bk_vals * STRIDE_POOL - PADDING
+
+    max_vals = tl.full([BLOCK_Q, BLOCK_BK], value=float("-inf"), dtype=tl.float32)
+
+    for ki in range(KSIZE):
+        k_pos = win_start_val + ki
+
+        win_start_clamped = tl.maximum(0, win_start_val)
+
+        valid_bk = (k_pos >= win_start_clamped) & (k_pos >= 0)
+
+        valid_qbk = (
+            (k_pos[None, :] < k_len[:, None])
+            & valid_bk[None, :]
+            & q_mask[:, None]
+            & bk_mask[None, :]
         )
 
-        win_start = tl.maximum(0, bk * STRIDE_POOL - PADDING)
-        win_end = tl.minimum(bk * STRIDE_POOL - PADDING + KSIZE, k_len)
-        has_window = win_end > win_start
+        load_offs = base_q[:, None] + k_pos[None, :]
+        vals = tl.load(score_ptr + load_offs, mask=valid_qbk, other=float("-inf"))
+        max_vals = tl.maximum(max_vals, vals.to(tl.float32))
 
-        offs = base[:, None] + win_start + offs_k[None, :]
-        mask = (win_start + offs_k[None, :] < win_end[:, None]) & q_mask[:, None]
-        vals = tl.load(score_ptr + offs, mask=mask, other=float("-inf"))
-        max_val = tl.max(vals, axis=1)
+    should_mask_inf = (bk_vals[None, :] < INIT_BLOCKS) | (
+        (off_bq[:, None] >= bk_vals[None, :])
+        & (off_bq[:, None] <= bk_vals[None, :] + LOCAL_BLOCKS)
+    )
 
-        result = tl.where(
-            should_mask_inf, float("inf"), tl.where(has_window, max_val, float("-inf"))
-        )
-        out_off = head * total_q * max_blocks + q_abs * max_blocks + bk
-        tl.store(
-            block_score_ptr + out_off,
-            result.to(score_ptr.dtype.element_ty),
-            mask=q_mask,
-        )
+    win_start_clamped = tl.maximum(0, win_start_val)
+    win_end = tl.minimum(win_start_val + KSIZE, k_len[:, None])
+    has_window = win_end > win_start_clamped[None, :]
+
+    result = tl.where(
+        should_mask_inf, float("inf"), tl.where(has_window, max_vals, float("-inf"))
+    )
+
+    out_offs = (
+        pid_head * total_q * max_blocks + q_abs[:, None] * max_blocks + bk_vals[None, :]
+    )
+    store_mask = q_mask[:, None] & bk_mask[None, :]
+    tl.store(
+        block_score_ptr + out_offs,
+        result.to(score_ptr.dtype.element_ty),
+        mask=store_mask,
+    )
 
 
 def max_pooling_1d_varlen_ref_triton(
@@ -107,7 +146,12 @@ def max_pooling_1d_varlen_ref_triton(
 
     ksize_pow2 = _next_pow2(ksize)
 
-    grid = (num_heads * max_blocks,)
+    grid = lambda META: (
+        num_heads,
+        triton.cdiv(total_q, META["BLOCK_Q"]),
+        triton.cdiv(max_blocks, META["BLOCK_BK"]),
+    )
+
     _max_pooling_1d_varlen_kernel[grid](
         score,
         block_score,
@@ -121,6 +165,7 @@ def max_pooling_1d_varlen_ref_triton(
         STRIDE_POOL=stride_pool,
         KSIZE=ksize,
         KSIZE_POW2=ksize_pow2,
+        PADDING=1,
         INIT_BLOCKS=init_blocks,
         LOCAL_BLOCKS=local_blocks,
         batch_size=batch_size,
