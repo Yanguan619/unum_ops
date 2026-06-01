@@ -31,9 +31,7 @@ def wrap_input_print_args(func):
 
             elif isinstance(value, list):
                 str_print[name]["type"] = str(type(value))
-                str_print[name]["value_preview10"] = str(
-                    value[:10] if len(value) > 10 else value
-                )
+                str_print[name]["value_preview10"] = str(value[:10] if len(value) > 10 else value)
             else:
                 str_print[name]["type"] = str(type(value))
                 str_print[name]["value"] = str(value)
@@ -48,15 +46,15 @@ def wrap_input_print_args(func):
 
 @wrap_input_print_args
 def npu_pa(
-    query,
-    key_cache,
-    value_cache,
-    num_heads,
-    num_kv_heads,
-    scale_value,
-    block_table,
-    context_lens,
-    out,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    scale_value: float,
+    block_table: torch.Tensor,
+    context_lens: torch.Tensor,
+    out: torch.Tensor,
 ):
     import torch_npu
 
@@ -106,9 +104,7 @@ def test_paged_attention(
     device = "npu:0"
     scaling = 0.08838834764831845
 
-    query = torch.randn(
-        num_tokens, num_heads, head_size, device=device, dtype=torch.bfloat16
-    )
+    query = torch.randn(num_tokens, num_heads, head_size, device=device, dtype=torch.bfloat16)
     key_cache = torch.randn(
         num_blocks,
         block_size,
@@ -133,9 +129,7 @@ def test_paged_attention(
         dtype=torch.int32,
     )
     context_lens = torch.full((num_tokens,), 0, dtype=torch.int32)
-    out = torch.randn(
-        num_tokens, num_heads, head_size_v, device=device, dtype=torch.bfloat16
-    )
+    out = torch.randn(num_tokens, num_heads, head_size_v, device=device, dtype=torch.bfloat16)
 
     npu_pa(
         query=query,

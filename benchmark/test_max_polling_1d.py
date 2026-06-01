@@ -80,15 +80,15 @@ def test_max_pooling_1d_varlen(dtype, device) -> None:
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: max_pooling_1d_varlen_ref_triton(
                     attn_score_full,
-                    kernel_size,
-                    kernel_stride,
-                    block_size,
                     cu_seqlens_q,
                     cu_seqlens_k,
+                    cache_lens,
                     max_seqlen_q,
-                    max_seqlen_k,
-                    init_blocks=init_blocks,
+                    max_context_len=max_seqlen_q,
                     local_blocks=local_blocks,
+                    init_blocks=init_blocks,
+                    block_size=block_size,
+                    stride=kernel_stride,
                 ),
                 quantiles=quantiles,
             )

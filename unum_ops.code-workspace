@@ -1,23 +1,29 @@
 {
     "folders": [
-		{
-			"path": "."
-		},
-		{
-			"path": "../infllmv2_cuda_impl"
-		},
-		{
-			"path": "../sparse_kernel"
-		},
-		{
-			"path": "../sglang"
-		},
-		{
-			"path": "../sglang-ori"
-		},
-		{
-			"path": "../FlagGems"
-		}
-	],
+        {
+            "path": "."
+        },
+        {
+            "path": "../infllmv2_cuda_impl"
+        },
+        {
+            "path": "../sparse_kernel"
+        },
+        {
+            "path": "../sglang"
+        },
+        {
+            "path": "../sglang-ori"
+        },
+        {
+            "path": "../FlagGems"
+        },
+        {
+            "path": "../../.config/opencode"
+        },
+        {
+            "path": "../../priviate_agent"
+        }
+    ],
     "settings": {}
 }

@@ -27,6 +27,7 @@ def _max_pooling_1d_varlen_kernel(
     block_score_ptr,
     cu_seqlens_q_ptr,
     cu_seqlens_k_ptr,
+    cache_lens_ptr,
     total_q,
     flat_stride,
     num_heads,
@@ -65,8 +66,9 @@ def _max_pooling_1d_varlen_kernel(
         qe = tl.load(cu_seqlens_q_ptr + b + 1)
         ks = tl.load(cu_seqlens_k_ptr + b)
         ke = tl.load(cu_seqlens_k_ptr + b + 1)
+        cache = tl.load(cache_lens_ptr + b)
         hit = (q_abs >= qs) & (q_abs < qe)
-        k_len = tl.where(hit, ke - ks, k_len)
+        k_len = tl.where(hit, (ke - ks) + cache, k_len)
         off_bq = tl.where(hit, (q_abs - qs) // BLOCK_SIZE, off_bq)
 
     base_q = pid_head * total_q * flat_stride + q_abs * flat_stride
@@ -118,30 +120,31 @@ def _max_pooling_1d_varlen_kernel(
 
 
 def max_pooling_1d_varlen_ref_triton(
-    score: torch.Tensor,
-    kernel_size: int,
-    kernel_stride: int,
-    block_size: int,
+    input: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
+    cache_lens: torch.Tensor,
     max_seqlen_q: int,
-    max_seqlen_k: int,
-    init_blocks: int = 1,
-    local_blocks: int = 2,
+    max_context_len: int,
+    local_blocks: int,
+    init_blocks: int,
+    block_size: int = 64,
+    stride: int = 16,
+    total_q: int = -1,
 ) -> torch.Tensor:
-    num_heads, total_q, _ = score.shape
+    num_heads, total_q, _ = input.shape
     batch_size = cu_seqlens_q.shape[0] - 1
-    max_blocks = math.ceil(max_seqlen_q / block_size)
+    max_blocks = math.ceil(max_context_len / block_size)
 
-    stride_pool = block_size // kernel_stride
+    stride_pool = block_size // stride
     ksize = stride_pool + 1
-    flat_stride = max_seqlen_q // kernel_stride
+    flat_stride = max_seqlen_q // stride
 
     block_score = torch.full(
         (num_heads, total_q, max_blocks),
         -float("inf"),
-        dtype=score.dtype,
-        device=score.device,
+        dtype=input.dtype,
+        device=input.device,
     )
 
     ksize_pow2 = _next_pow2(ksize)
@@ -153,10 +156,11 @@ def max_pooling_1d_varlen_ref_triton(
     )
 
     _max_pooling_1d_varlen_kernel[grid](
-        score,
+        input,
         block_score,
         cu_seqlens_q,
         cu_seqlens_k,
+        cache_lens,
         total_q,
         flat_stride,
         num_heads,
