@@ -3,7 +3,6 @@ from pathlib import Path
 import pytest
 import torch
 import triton
-from infllm_v2 import infllmv2_attn_stage1
 
 from unum_ops.infllm_v2 import (
     infllmv2_attn_stage1_triton,
@@ -73,11 +72,17 @@ def test_infllmv2_attn_stage1(dtype, device) -> None:
         q = q.clone()
         k = k.clone()
         v = k.clone()
-        call_ops = {
-            "cuda": infllmv2_attn_stage1,
-            "triton": infllmv2_attn_stage1_triton,
-            "triton_v2": infllmv2_attn_stage1_triton_v2,
-        }
+        if provider == "cuda":
+            from infllm_v2 import infllmv2_attn_stage1
+
+            call_ops = {
+                "cuda": infllmv2_attn_stage1,
+            }
+        else:
+            call_ops = {
+                "triton": infllmv2_attn_stage1_triton,
+                "triton_v2": infllmv2_attn_stage1_triton_v2,
+            }
         quantiles = [0.5, 0.2, 0.8]
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: call_ops[provider](

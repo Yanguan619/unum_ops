@@ -18,6 +18,14 @@ def _next_pow2(n):
         triton.Config({"BLOCK_Q": 16, "BLOCK_BK": 8}, num_warps=4, num_stages=2),
         triton.Config({"BLOCK_Q": 32, "BLOCK_BK": 4}, num_warps=8, num_stages=2),
         triton.Config({"BLOCK_Q": 64, "BLOCK_BK": 4}, num_warps=8, num_stages=2),
+    ]
+    if not torch.npu.is_available()
+    else [
+        triton.Config({"BLOCK_Q": 128, "BLOCK_BK": 4}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_Q": 128, "BLOCK_BK": 8}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_Q": 256, "BLOCK_BK": 8}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_Q": 64, "BLOCK_BK": 16}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_Q": 128, "BLOCK_BK": 16}, num_warps=8, num_stages=2),
     ],
     key=["total_q", "max_blocks"],
 )
@@ -91,26 +99,23 @@ def _max_pooling_1d_varlen_kernel(
             & bk_mask[None, :]
         )
 
-        load_offs = base_q[:, None] + k_pos[None, :]
+        k_pos_clamped = tl.maximum(k_pos, 0)
+        load_offs = base_q[:, None] + k_pos_clamped[None, :]
+
         vals = tl.load(score_ptr + load_offs, mask=valid_qbk, other=float("-inf"))
         max_vals = tl.maximum(max_vals, vals.to(tl.float32))
 
     should_mask_inf = (bk_vals[None, :] < INIT_BLOCKS) | (
-        (off_bq[:, None] >= bk_vals[None, :])
-        & (off_bq[:, None] <= bk_vals[None, :] + LOCAL_BLOCKS)
+        (off_bq[:, None] >= bk_vals[None, :]) & (off_bq[:, None] <= bk_vals[None, :] + LOCAL_BLOCKS)
     )
 
     win_start_clamped = tl.maximum(0, win_start_val)
     win_end = tl.minimum(win_start_val + KSIZE, k_len[:, None])
     has_window = win_end > win_start_clamped[None, :]
 
-    result = tl.where(
-        should_mask_inf, float("inf"), tl.where(has_window, max_vals, float("-inf"))
-    )
+    result = tl.where(should_mask_inf, float("inf"), tl.where(has_window, max_vals, float("-inf")))
 
-    out_offs = (
-        pid_head * total_q * max_blocks + q_abs[:, None] * max_blocks + bk_vals[None, :]
-    )
+    out_offs = pid_head * total_q * max_blocks + q_abs[:, None] * max_blocks + bk_vals[None, :]
     store_mask = q_mask[:, None] & bk_mask[None, :]
     tl.store(
         block_score_ptr + out_offs,

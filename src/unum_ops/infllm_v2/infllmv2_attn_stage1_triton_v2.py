@@ -102,9 +102,7 @@ def _infllmv2_attn_stage1_kernel(
             eviction_policy="evict_last",
         ).to(tl.bfloat16)
 
-        scores_2d = (
-            tl.dot(q_group_bf16, tl.trans(k_tile_bf16)).to(tl.float32) * scale_f32
-        )
+        scores_2d = tl.dot(q_group_bf16, tl.trans(k_tile_bf16)).to(tl.float32) * scale_f32
         scores_2d = tl.where(k_mask[None, :], scores_2d, float("-inf"))
 
         if causal:
@@ -135,9 +133,7 @@ def _infllmv2_attn_stage1_kernel(
             eviction_policy="evict_first",
         ).to(tl.bfloat16)
 
-        scores_2d = (
-            tl.dot(q_group_bf16, tl.trans(k_tile_bf16)).to(tl.float32) * scale_f32
-        )
+        scores_2d = tl.dot(q_group_bf16, tl.trans(k_tile_bf16)).to(tl.float32) * scale_f32
         scores_2d = tl.where(k_mask[None, :], scores_2d, float("-inf"))
 
         if causal:
@@ -148,10 +144,7 @@ def _infllmv2_attn_stage1_kernel(
         block_out = tl.sum(softmax_all, axis=0)
 
         tl.store(
-            out_ptr
-            + head_group * stride_out_h
-            + q_pos * stride_out_q
-            + offs_k * stride_out_k,
+            out_ptr + head_group * stride_out_h + q_pos * stride_out_q + offs_k * stride_out_k,
             block_out,
             mask=k_mask,
         )
@@ -176,9 +169,7 @@ def infllmv2_attn_stage1_triton_v2(
     return_attn_probs=True,
     block_table=None,
 ):
-    q, k, v = [
-        x.contiguous() if x is not None and x.stride(-1) != 1 else x for x in (q, k, v)
-    ]
+    q, k, v = [x.contiguous() if x is not None and x.stride(-1) != 1 else x for x in (q, k, v)]
 
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -189,14 +180,10 @@ def infllmv2_attn_stage1_triton_v2(
     batch_size = cu_seqlens_q.numel() - 1
 
     if max_seqlen_k is None or max_seqlen_k == 0:
-        max_seqlen_k = max(
-            int(cu_seqlens_k[i + 1] - cu_seqlens_k[i]) for i in range(batch_size)
-        )
+        max_seqlen_k = max(int(cu_seqlens_k[i + 1] - cu_seqlens_k[i]) for i in range(batch_size))
 
     round_block_k = 128
-    max_k_rounded = (
-        round_multiple(max_seqlen_k, round_block_k) if max_seqlen_k > 0 else 0
-    )
+    max_k_rounded = round_multiple(max_seqlen_k, round_block_k) if max_seqlen_k > 0 else 0
 
     out = torch.zeros(
         n_kv_heads,

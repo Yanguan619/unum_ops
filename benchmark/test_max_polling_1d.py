@@ -3,7 +3,6 @@ from pathlib import Path
 import pytest
 import torch
 import triton
-from infllm_v2.max_pooling_1d import max_pooling_1d_varlen
 
 from unum_ops.infllm_v2 import max_pooling_1d_varlen_ref_triton
 
@@ -54,13 +53,13 @@ def test_max_pooling_1d_varlen(dtype, device) -> None:
         max_seqlen_k = seqlen * 2
         cu_seqlens_q = torch.tensor([0, seqlen], dtype=torch.int32, device=device)
         cu_seqlens_k = torch.tensor([0, seqlen * 2], dtype=torch.int32, device=device)
-        attn_score_full = torch.randn(
-            num_heads, seqlen, max_seqlen_k, device=device, dtype=dtype
-        )
+        attn_score_full = torch.randn(num_heads, seqlen, max_seqlen_k, device=device, dtype=dtype)
         cache_lens = torch.zeros(batch_size, dtype=torch.int32, device=device)
 
         quantiles = [0.5, 0.2, 0.8]
         if provider == "cuda":
+            from infllm_v2.max_pooling_1d import max_pooling_1d_varlen
+
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: max_pooling_1d_varlen(
                     attn_score_full,

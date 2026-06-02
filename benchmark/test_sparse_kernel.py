@@ -12,9 +12,6 @@ from unum_ops.sparse_kernel_extension import (
     get_block_table_ref_triton_v3,
 )
 
-if torch.cuda.is_available():
-    import sparse_kernel_extension
-
 logging.basicConfig(level=logging.DEBUG)
 torch.manual_seed(42)
 # decode
@@ -185,27 +182,32 @@ def test_bench_get_table_triton(device):
                 ),
                 quantiles=quantiles,
             )
-        elif provider == "cuda":
-            ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: sparse_kernel_extension.get_block_table_v1(
-                    topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q, kSparseTopK
-                ),
-                quantiles=quantiles,
-            )
-        elif provider == "cuda2":
-            ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: sparse_kernel_extension.get_block_table_v2(
-                    topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q, kSparseTopK
-                ),
-                quantiles=quantiles,
-            )
-        elif provider == "cuda3":
-            ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: sparse_kernel_extension.get_block_table_v3(
-                    topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q, kSparseTopK
-                ),
-                quantiles=quantiles,
-            )
+        elif provider.startswith("cuda"):
+            import sparse_kernel_extension
+
+            if provider == "cuda":
+                ms, min_ms, max_ms = triton.testing.do_bench(
+                    lambda: sparse_kernel_extension.get_block_table_v1(
+                        topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q, kSparseTopK
+                    ),
+                    quantiles=quantiles,
+                )
+            elif provider == "cuda2":
+                ms, min_ms, max_ms = triton.testing.do_bench(
+                    lambda: sparse_kernel_extension.get_block_table_v2(
+                        topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q, kSparseTopK
+                    ),
+                    quantiles=quantiles,
+                )
+            elif provider == "cuda3":
+                ms, min_ms, max_ms = triton.testing.do_bench(
+                    lambda: sparse_kernel_extension.get_block_table_v3(
+                        topk_idx, block_table, token_to_bs, seqlen_q, seqlen_q, kSparseTopK
+                    ),
+                    quantiles=quantiles,
+                )
+            else:
+                raise ValueError(f"Unknown provider: {provider}")
         else:
             raise ValueError(f"Unknown provider: {provider}")
 
