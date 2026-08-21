@@ -10,6 +10,10 @@
 
 constexpr uint32_t VOXEL_TILE_POINTS = 1024;
 constexpr uint32_t VOXEL_MAX_CORES = 8;
+// BlockCount/AssignVoxelIds 批量处理 chunk（int32 元素数）；bufRaw_ = 16KB = 4096 int32
+constexpr uint32_t VOXEL_BIN_CHUNK = 4096;
+// CountPoints 分组刷写上限：bufRaw_ = 4096 int32 = 512 组 × 8 int32
+constexpr uint32_t MAX_COUNT_GROUPS = 512;
 
 struct VoxelizationTilingData {
     // --- 10×uint32 (40 bytes) ---

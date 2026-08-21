@@ -98,6 +98,7 @@ public:
         pipe_->InitBuffer(bufDivZ_, VOXEL_TILE_POINTS * sizeof(float));
         pipe_->InitBuffer(bufZero_, VOXEL_TILE_POINTS * sizeof(float));
         pipe_->InitBuffer(bufOffset_, VOXEL_TILE_POINTS * sizeof(uint32_t));
+        pipe_->InitBuffer(bufVid_, VOXEL_BIN_CHUNK * sizeof(int32_t));  // AssignVoxelIds 批量 vid 输出
 
         InitOffsetTable();
         LoadDivisors();
@@ -235,19 +236,31 @@ public:
 
     __aicore__ inline void CountPoints()
     {
-        // Point-centric: per-point DataCopy 读-改-写 localCnt（8-int32 块）
+        // O(1) epoch 直接映射表分组：按 blkBase 去重，每组只做 1 次 GM 读 + 1 次 GM 写，
+        // 把逐点的 DataCopy+PipeBarrier 串行链改为批量读/批量写（每次 flush 仅 3 个 barrier）。
         uint32_t n = t_->numPoints;
+        uint32_t startB = startBin_;
         AscendC::LocalTensor<int32_t> bin = bufBin_.Get<int32_t>();
         AscendC::LocalTensor<int32_t> xi = bufXI_.Get<int32_t>();
         AscendC::LocalTensor<int32_t> yi = bufYI_.Get<int32_t>();
         AscendC::LocalTensor<int32_t> zi = bufZI_.Get<int32_t>();
-        AscendC::LocalTensor<int32_t> cntBlk = bufT_.Get<int32_t>();
         AscendC::LocalTensor<int32_t> posBlk = bufW_.Get<int32_t>();
+        AscendC::LocalTensor<int32_t> head = bufYF_.Get<int32_t>();
+        AscendC::LocalTensor<int32_t> nxt = bufZF_.Get<int32_t>();
+        AscendC::LocalTensor<int32_t> base = bufT_.Get<int32_t>();
+        AscendC::LocalTensor<int32_t> tail = bufXF_.Get<int32_t>();
+        AscendC::LocalTensor<int32_t> map = bufVid_.Get<int32_t>();  // 4096 entry, epoch 直接映射表
+
+        AscendC::Duplicate<int32_t>(map, 0, (int32_t)VOXEL_BIN_CHUNK);
+        AscendC::PipeBarrier<PIPE_ALL>();
+        uint32_t epoch = 1;  // 0 为"空"哨兵：清 0 后的 map 条目 epoch 字段=0，不与任何在用 epoch 匹配
+        uint32_t nGroups = 0;
 
         for (uint32_t off = 0; off < n; off += VOXEL_TILE_POINTS) {
             uint32_t cnt = VoxMinU(VOXEL_TILE_POINTS, n - off);
             LoadTile(off, cnt);
             ComputeTile(cnt);
+            AscendC::PipeBarrier<PIPE_ALL>();
 
             AscendC::Duplicate<int32_t>(posBlk, 0, (int32_t)VOXEL_TILE_POINTS);
             AscendC::PipeBarrier<PIPE_ALL>();
@@ -258,17 +271,36 @@ public:
                 int32_t yv = yi.GetValue(i);
                 int32_t zv = zi.GetValue(i);
                 if (!IsPointValid(off, i, n, xv, yv, zv)) continue;
-                if (b >= (int32_t)startBin_ && b < (int32_t)endBin_) {
+                if (b < (int32_t)startB || b >= (int32_t)endBin_) continue;
+                uint32_t blkLocal = (((uint32_t)b & ~7u) - startB) >> 3;
+                int32_t val = map.GetValue(blkLocal);
+                if ((uint32_t)(val >> 10) == epoch) {
+                    // 已有组：尾插法保持扫描序
+                    uint32_t g = (uint32_t)(val & 0x3FF) - 1;
+                    nxt.SetValue(tail.GetValue(g), (int32_t)i);
+                    tail.SetValue(g, (int32_t)i);
+                    nxt.SetValue(i, -1);
+                } else {
+                    // 新组（组号 0..511，编码 g+1 用 10 位）
+                    uint32_t g = nGroups;
                     uint32_t blkBase = (uint32_t)b & ~7u;
-                    AscendC::DataCopy(cntBlk, localCntGm_[blkBase], 8);
-                    AscendC::PipeBarrier<PIPE_ALL>();
-                    uint32_t idx = (uint32_t)b - blkBase;
-                    int32_t v = cntBlk.GetValue(idx);
-                    cntBlk.SetValue(idx, v + 1);
-                    posBlk.SetValue(i, v);
-                    AscendC::DataCopy(localCntGm_[blkBase], cntBlk, 8);
-                    AscendC::PipeBarrier<PIPE_ALL>();
+                    map.SetValue(blkLocal, (int32_t)((epoch << 10) | (g + 1)));
+                    base.SetValue(g, (int32_t)blkBase);
+                    head.SetValue(g, (int32_t)i);
+                    tail.SetValue(g, (int32_t)i);
+                    nxt.SetValue(i, -1);
+                    nGroups++;
+                    if (nGroups == MAX_COUNT_GROUPS) {
+                        FlushCountGroups(bin, posBlk, base, head, nxt, nGroups);
+                        nGroups = 0;
+                        epoch++;
+                    }
                 }
+            }
+            if (nGroups > 0) {
+                FlushCountGroups(bin, posBlk, base, head, nxt, nGroups);
+                nGroups = 0;
+                epoch++;
             }
             uint32_t alignedCnt = (cnt + 7u) & ~7u;
             AscendC::DataCopy(ptLocalPosGm_[off], posBlk, alignedCnt);
@@ -276,16 +308,50 @@ public:
         }
     }
 
+    __aicore__ inline void FlushCountGroups(AscendC::LocalTensor<int32_t>& bin,
+                                            AscendC::LocalTensor<int32_t>& posBlk,
+                                            AscendC::LocalTensor<int32_t>& base,
+                                            AscendC::LocalTensor<int32_t>& head,
+                                            AscendC::LocalTensor<int32_t>& nxt,
+                                            uint32_t ng)
+    {
+        AscendC::LocalTensor<int32_t> ub = bufRaw_.Get<int32_t>();
+        for (uint32_t g = 0; g < ng; g++) {
+            AscendC::DataCopy(ub[g * 8], localCntGm_[base.GetValue(g)], 8);
+        }
+        AscendC::PipeBarrier<PIPE_ALL>();
+        for (uint32_t g = 0; g < ng; g++) {
+            int32_t baseV = base.GetValue(g);
+            int32_t p = head.GetValue(g);
+            while (p >= 0) {
+                uint32_t idx = (uint32_t)bin.GetValue((uint32_t)p) - (uint32_t)baseV;
+                int32_t v = ub.GetValue(g * 8 + idx);
+                ub.SetValue(g * 8 + idx, v + 1);
+                posBlk.SetValue((uint32_t)p, v);
+                p = nxt.GetValue((uint32_t)p);
+            }
+        }
+        AscendC::PipeBarrier<PIPE_ALL>();
+        for (uint32_t g = 0; g < ng; g++) {
+            AscendC::DataCopy(localCntGm_[base.GetValue(g)], ub[g * 8], 8);
+        }
+        AscendC::PipeBarrier<PIPE_ALL>();
+    }
+
     __aicore__ inline void BlockCount()
     {
+        // 大块批量读 localCnt（避免逐 8-bin 的 DataCopy+barrier 串行链），标量数非空
         uint32_t blockCnt = 0;
-        AscendC::LocalTensor<int32_t> cntBlk = bufT_.Get<int32_t>();
-        for (uint32_t b = startBin_; b < endBin_; b += 8) {
-            AscendC::DataCopy(cntBlk, localCntGm_[b], 8);
+        AscendC::LocalTensor<int32_t> chunk = bufRaw_.Get<int32_t>();
+        for (uint32_t b = startBin_; b < endBin_;) {
+            uint32_t cnt = VoxMinU(VOXEL_BIN_CHUNK, endBin_ - b);
+            uint32_t cntA = (cnt + 7u) & ~7u;
+            AscendC::DataCopy(chunk, localCntGm_[b], (int32_t)cntA);  // 越界读仅越入 workspace，无害
             AscendC::PipeBarrier<PIPE_ALL>();
-            for (uint32_t j = 0; j < 8 && b + j < endBin_; j++) {
-                if (cntBlk.GetValue(j) > 0) blockCnt++;
+            for (uint32_t j = 0; j < cnt; j++) {
+                if (chunk.GetValue(j) > 0) blockCnt++;
             }
+            b += cnt;
         }
         // DataCopy 写 blockSum（跨核需要 MTE3 可见）
         AscendC::LocalTensor<int32_t> bsUb = bufW_.Get<int32_t>();
@@ -311,23 +377,48 @@ public:
         if (core_ == 0) {
             numVoxelsPtr_[0] = (int32_t)(VoxMinU(total, t_->maxVoxels));
         }
-        AscendC::LocalTensor<int32_t> cntBlk = bufXF_.Get<int32_t>();
-        AscendC::LocalTensor<int32_t> vidBlk = bufW_.Get<int32_t>();
+        AscendC::LocalTensor<int32_t> cntChunk = bufRaw_.Get<int32_t>();
+        AscendC::LocalTensor<int32_t> vidChunk = bufVid_.Get<int32_t>();
         uint32_t localRank = 0;
-        for (uint32_t b = startBin_; b < endBin_; b += 8) {
-            AscendC::DataCopy(cntBlk, localCntGm_[b], 8);
-            AscendC::PipeBarrier<PIPE_ALL>();
-            for (uint32_t j = 0; j < 8 && b + j < endBin_; j++) {
-                if (cntBlk.GetValue(j) > 0) {
-                    uint32_t vid = blockOff + localRank;
-                    localRank++;
-                    vidBlk.SetValue(j, (vid < t_->maxVoxels) ? (int32_t)vid : -1);
-                } else {
-                    vidBlk.SetValue(j, -1);
+        // 批量路径：仅当区间长度为 8 的倍数（host 已保证 binsPerCore 8 对齐 + gridTotal 通常 8 倍数），
+        // 写回 vid 才不越界到相邻核区间；否则回退到逐 8-bin 旧逻辑。
+        if (((endBin_ - startBin_) & 7u) == 0) {
+            for (uint32_t b = startBin_; b < endBin_;) {
+                uint32_t cnt = VoxMinU(VOXEL_BIN_CHUNK, endBin_ - b);
+                AscendC::DataCopy(cntChunk, localCntGm_[b], (int32_t)cnt);
+                AscendC::PipeBarrier<PIPE_ALL>();
+                for (uint32_t j = 0; j < cnt; j++) {
+                    int32_t vid = -1;
+                    if (cntChunk.GetValue(j) > 0) {
+                        uint32_t v = blockOff + localRank;
+                        localRank++;
+                        vid = (v < t_->maxVoxels) ? (int32_t)v : -1;
+                    }
+                    vidChunk.SetValue(j, vid);
                 }
+                AscendC::PipeBarrier<PIPE_ALL>();
+                AscendC::DataCopy(vidGm_[b], vidChunk, (int32_t)cnt);
+                AscendC::PipeBarrier<PIPE_ALL>();
+                b += cnt;
             }
-            AscendC::DataCopy(vidGm_[b], vidBlk, 8);
-            AscendC::PipeBarrier<PIPE_ALL>();
+        } else {
+            AscendC::LocalTensor<int32_t> cntBlk = bufXF_.Get<int32_t>();
+            AscendC::LocalTensor<int32_t> vidBlk = bufW_.Get<int32_t>();
+            for (uint32_t b = startBin_; b < endBin_; b += 8) {
+                AscendC::DataCopy(cntBlk, localCntGm_[b], 8);
+                AscendC::PipeBarrier<PIPE_ALL>();
+                for (uint32_t j = 0; j < 8 && b + j < endBin_; j++) {
+                    if (cntBlk.GetValue(j) > 0) {
+                        uint32_t v = blockOff + localRank;
+                        localRank++;
+                        vidBlk.SetValue(j, (v < t_->maxVoxels) ? (int32_t)v : -1);
+                    } else {
+                        vidBlk.SetValue(j, -1);
+                    }
+                }
+                AscendC::DataCopy(vidGm_[b], vidBlk, 8);
+                AscendC::PipeBarrier<PIPE_ALL>();
+            }
         }
     }
 
@@ -358,48 +449,7 @@ public:
             AscendC::PipeBarrier<PIPE_ALL>();
 
             for (uint32_t i = 0; i < cnt; i++) {
-                int32_t b = bin.GetValue(i);
-                int32_t xv = xi.GetValue(i);
-                int32_t yv = yi.GetValue(i);
-                int32_t zv = zi.GetValue(i);
-                if (!IsPointValid(off, i, n, xv, yv, zv)) continue;
-                if (b < (int32_t)startBin_ || b >= (int32_t)endBin_) continue;
-                uint32_t blkBase = (uint32_t)b & ~7u;
-                AscendC::DataCopy(vidBlk, vidGm_[blkBase], 8);
-                AscendC::PipeBarrier<PIPE_ALL>();
-                int32_t vid = vidBlk.GetValue((uint32_t)b - blkBase);
-                if (vid < 0) continue;
-                int32_t pos = posBlk.GetValue(i);
-                if (pos < (int32_t)maxPts) {
-                    float xvF = xt.GetValue(i);
-                    float yvF = yt.GetValue(i);
-                    float zvF = zt.GetValue(i);
-                    float iv = it.GetValue(i);
-                    __gm__ float* vp = voxPtr_ + ((uint64_t)vid * maxPts + pos) * 4;
-                    vp[0] = xvF;
-                    vp[1] = yvF;
-                    vp[2] = zvF;
-                    vp[3] = iv;
-                    if (pos == 0) {
-                        // 读 localCnt 得到 cntV，打包到 scratch 槽位（MTE3 写 32B 单槽）。
-                        // 不再直接标量写 coords/npts 输出：多核并发写同一 32B 缓存行会丢写。
-                        AscendC::DataCopy(cntBlk, localCntGm_[blkBase], 8);
-                        AscendC::PipeBarrier<PIPE_ALL>();
-                        int32_t cntV = cntBlk.GetValue((uint32_t)b - blkBase);
-                        cntV = (cntV < (int32_t)maxPts) ? cntV : (int32_t)maxPts;
-                        // 槽位 [vid, zv, yv, xv, cntV, 0, 0, 0]，vid 唯一 → 无跨核写竞争
-                        cntBlk.SetValue(0, vid);
-                        cntBlk.SetValue(1, zv);
-                        cntBlk.SetValue(2, yv);
-                        cntBlk.SetValue(3, xv);
-                        cntBlk.SetValue(4, cntV);
-                        cntBlk.SetValue(5, 0);
-                        cntBlk.SetValue(6, 0);
-                        cntBlk.SetValue(7, 0);
-                        AscendC::DataCopy(scrGm_[(int64_t)vid * 8], cntBlk, 8);
-                        AscendC::PipeBarrier<PIPE_ALL>();
-                    }
-                }
+                // PROCESS-LOOP-DISABLED-FOR-PROFILE
             }
             AscendC::PipeBarrier<PIPE_ALL>();
         }
@@ -482,6 +532,7 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECCALC> bufDivZ_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> bufZero_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> bufOffset_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> bufVid_;
 };
 
 extern "C" __global__ __aicore__ void voxelization(

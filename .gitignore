@@ -12,3 +12,5 @@ __pycache__/
 csrc/ascend/voxelization/test/data/output/
 *.om
 test/build/
+csrc/ascend/custom_op_temp/
+session-unum_ops_vox.md

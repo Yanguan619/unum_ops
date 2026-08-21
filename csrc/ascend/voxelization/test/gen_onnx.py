@@ -1,29 +1,14 @@
-#!/usr/bin/python3
-# coding=utf-8
-
-# ----------------------------------------------------------------------------------------------------------
-# Copyright (c) 2025 Huawei Technologies Co., Ltd.
-# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
-# CANN Open Software License Agreement Version 2.0 (the "License").
-# Please refer to the License for details. You may not use this file except in compliance with the License.
-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
-# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
-# See LICENSE in the root of the software repository for the full text of the License.
-# ----------------------------------------------------------------------------------------------------------
-
-
 from onnx import TensorProto
 from onnx.helper import (make_model, make_node, make_graph, make_tensor_value_info)
 from onnx.checker import check_model
 
 # 定义输入
-points = make_tensor_value_info("points", TensorProto.FLOAT, [None, None, None])
-
+points = make_tensor_value_info("points", TensorProto.FLOAT, ["batch", "num_points", "features"])
 # 定义输出
-voxels = make_tensor_value_info("voxels", TensorProto.FLOAT, [None, None, None])
-coords = make_tensor_value_info("coords", TensorProto.INT32, [None, None])
-num_points = make_tensor_value_info("num_points", TensorProto.INT32, [None])
-num_voxels = make_tensor_value_info("num_voxels", TensorProto.INT32, [None])
+voxels = make_tensor_value_info("voxels", TensorProto.FLOAT, ["batch", "max_voxels", "features"])
+coords = make_tensor_value_info("coords", TensorProto.INT32, ["max_voxels", "coord_dim"])
+num_points = make_tensor_value_info("num_points", TensorProto.INT32, ["max_voxels"])
+num_voxels = make_tensor_value_info("num_voxels", TensorProto.INT32, ["batch"])
 
 # 创建 Voxelization 节点
 voxelization_node = make_node(
