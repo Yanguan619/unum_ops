@@ -11,7 +11,6 @@ endif()
 find_package(Torch REQUIRED)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
-# torch_npu 头文件位置（通过 python 探测）
 execute_process(
     COMMAND ${Python3_EXECUTABLE} -c
         "import torch_npu, os; print(os.path.dirname(torch_npu.__file__))"
@@ -24,7 +23,7 @@ include_directories(
     ${TORCH_NPU_DIR}/include
     ${ASCEND_HOME_PATH}/aarch64-linux/include
     ${ASCEND_HOME_PATH}/opp/vendors/customize/op_api/include
-    /usr/local/python3.11.15/include/python3.11  # Python.h
+    /usr/local/python3.11.15/include/python3.11
 )
 
 set(SOURCES
