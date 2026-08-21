@@ -11,22 +11,17 @@ namespace ascend_kernel {
 
 namespace {
 
-aclTensor* MakeTensor(aclDataType dataType, const at::Tensor& t) {
-    auto ndim = t.dim();
-    if (ndim == 0) {
-        int64_t shape[1] = {1};
-        int64_t strides[1] = {1};
-        return aclCreateTensor(shape, 1, dataType, strides, ACL_FORMAT_ND, ACL_FORMAT_ND,
-                               shape, 1, t.mutable_data_ptr());
-    }
-    std::vector<int64_t> shape(ndim);
+aclTensor* MakeTensorFromPtr(aclDataType dataType, const std::vector<int64_t>& shape,
+                             void* ptr) {
+    int64_t ndim = shape.size();
     std::vector<int64_t> strides(ndim);
-    for (int i = 0; i < ndim; i++) {
-        shape[i] = t.size(i);
-        strides[i] = t.stride(i);
+    int64_t s = 1;
+    for (int i = ndim - 1; i >= 0; i--) {
+        strides[i] = s;
+        s *= shape[i];
     }
     return aclCreateTensor(shape.data(), ndim, dataType, strides.data(), ACL_FORMAT_ND,
-                           ACL_FORMAT_ND, shape.data(), ndim, t.mutable_data_ptr());
+                           ACL_FORMAT_ND, shape.data(), ndim, ptr);
 }
 
 }  // namespace
@@ -42,25 +37,33 @@ VoxelizationOutputs voxelization(const at::Tensor& points, c10::ArrayRef<double>
 
     auto N = points.size(0);
 
-    // 分配输出（full capacity, 用 empty 避免 zeros_like 的乱序问题）
-    at::Tensor voxels = at::empty({max_voxels, max_num_points, 4},
-                                  points.options().dtype(at::kFloat));
-    at::Tensor coords = at::empty({max_voxels, 3},
-                                  points.options().dtype(at::kInt));
-    at::Tensor num_points = at::empty({max_voxels},
-                                      points.options().dtype(at::kInt));
-    at::Tensor num_voxels = at::empty({1},
-                                      points.options().dtype(at::kInt));
-
     // 获取 NPU stream（stream(true) 清 queue，防乱序）
     auto aclStream = c10_npu::getCurrentNPUStream().stream(true);
 
-    // 创建 aclTensor 包装 torch tensor
-    aclTensor* ptsTensor = MakeTensor(ACL_FLOAT, points);
-    aclTensor* voxTensor = MakeTensor(ACL_FLOAT, voxels);
-    aclTensor* coordTensor = MakeTensor(ACL_INT32, coords);
-    aclTensor* nptsTensor = MakeTensor(ACL_INT32, num_points);
-    aclTensor* nvoxTensor = MakeTensor(ACL_INT32, num_voxels);
+    // 用 aclrtMalloc 分配输出（与 C++ 测试一致，绕过框架对 torch 内存的 +8 处理差异）
+    size_t voxBytes = max_voxels * max_num_points * 4 * sizeof(float);
+    size_t coordBytes = max_voxels * 3 * sizeof(int32_t);
+    size_t nptsBytes = max_voxels * sizeof(int32_t);
+    size_t nvoxBytes = 64;
+
+    void* voxDev = nullptr; void* coordDev = nullptr;
+    void* nptsDev = nullptr; void* nvoxDev = nullptr;
+    aclrtMalloc(&voxDev, voxBytes, ACL_MEM_MALLOC_HUGE_FIRST);
+    aclrtMalloc(&coordDev, coordBytes, ACL_MEM_MALLOC_HUGE_FIRST);
+    aclrtMalloc(&nptsDev, nptsBytes, ACL_MEM_MALLOC_HUGE_FIRST);
+    aclrtMalloc(&nvoxDev, nvoxBytes, ACL_MEM_MALLOC_HUGE_FIRST);
+
+    // 创建 aclTensor（points 用 torch 输入指针，输出用 aclrtMalloc 指针）
+    std::vector<int64_t> inShape = {N, 4};
+    std::vector<int64_t> inStrides = {4, 1};
+    aclTensor* ptsTensor = aclCreateTensor(inShape.data(), 2, ACL_FLOAT, inStrides.data(),
+                                           ACL_FORMAT_ND, ACL_FORMAT_ND, inShape.data(), 2,
+                                           points.data_ptr());
+
+    aclTensor* voxTensor = MakeTensorFromPtr(ACL_FLOAT, {max_voxels, max_num_points, 4}, voxDev);
+    aclTensor* coordTensor = MakeTensorFromPtr(ACL_INT32, {max_voxels, 3}, coordDev);
+    aclTensor* nptsTensor = MakeTensorFromPtr(ACL_INT32, {max_voxels}, nptsDev);
+    aclTensor* nvoxTensor = MakeTensorFromPtr(ACL_INT32, {1}, nvoxDev);
 
     // 参数数组
     float vs[3] = {(float)voxel_size[0], (float)voxel_size[1], (float)voxel_size[2]};
@@ -78,7 +81,6 @@ VoxelizationOutputs voxelization(const at::Tensor& points, c10::ArrayRef<double>
         &workspaceSize, &executor);
     TORCH_CHECK(st == ACL_SUCCESS, "aclnnVoxelizationGetWorkspaceSize failed: ", st);
 
-    // 分配 workspace
     void* wsDev = nullptr;
     if (workspaceSize > 0) {
         aclrtMalloc(&wsDev, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
@@ -87,9 +89,23 @@ VoxelizationOutputs voxelization(const at::Tensor& points, c10::ArrayRef<double>
     // 执行
     st = aclnnVoxelization(wsDev, workspaceSize, executor, aclStream);
     TORCH_CHECK(st == ACL_SUCCESS, "aclnnVoxelization failed: ", st);
-
-    // 同步等待完成
     aclrtSynchronizeStream(aclStream);
+
+    // 读 num_voxels（仅校验用）
+    int32_t nvox[16];
+    aclrtMemcpy(nvox, nvoxBytes, nvoxDev, nvoxBytes, ACL_MEMCPY_DEVICE_TO_HOST);
+    (void)nvox[0];
+
+    // 分配 torch 输出并 D2D 拷贝
+    at::Tensor voxels = at::empty({max_voxels, max_num_points, 4}, points.options().dtype(at::kFloat));
+    at::Tensor coords = at::empty({max_voxels, 3}, points.options().dtype(at::kInt));
+    at::Tensor num_points = at::empty({max_voxels}, points.options().dtype(at::kInt));
+    at::Tensor num_voxels = at::empty({1}, points.options().dtype(at::kInt));
+
+    aclrtMemcpy(voxels.mutable_data_ptr(), voxBytes, voxDev, voxBytes, ACL_MEMCPY_DEVICE_TO_DEVICE);
+    aclrtMemcpy(coords.mutable_data_ptr(), coordBytes, coordDev, coordBytes, ACL_MEMCPY_DEVICE_TO_DEVICE);
+    aclrtMemcpy(num_points.mutable_data_ptr(), nptsBytes, nptsDev, nptsBytes, ACL_MEMCPY_DEVICE_TO_DEVICE);
+    aclrtMemcpy(num_voxels.mutable_data_ptr(), 4, nvoxDev, 4, ACL_MEMCPY_DEVICE_TO_DEVICE);
 
     // 清理
     aclDestroyTensor(ptsTensor);
@@ -99,6 +115,7 @@ VoxelizationOutputs voxelization(const at::Tensor& points, c10::ArrayRef<double>
     aclDestroyTensor(nvoxTensor);
     aclDestroyFloatArray(vsArr);
     aclDestroyFloatArray(pcrArrAc);
+    aclrtFree(voxDev); aclrtFree(coordDev); aclrtFree(nptsDev); aclrtFree(nvoxDev);
     if (wsDev) aclrtFree(wsDev);
 
     return {voxels, coords, num_points, num_voxels};
