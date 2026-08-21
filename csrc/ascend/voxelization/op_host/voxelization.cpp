@@ -1,7 +1,9 @@
 #include <cstring>
+#include <cstdio>
 
 #include "../op_kernel/voxelization_tiling.h"
 #include "register/op_def_registry.h"
+#include "register/op_impl_registry.h"
 #include "tiling/platform/platform_ascendc.h"
 
 namespace optiling {
@@ -103,31 +105,75 @@ namespace ge {
 
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
+    {
+        static bool first = true;
+        if (first) {
+            first = false;
+            FILE* f = fopen("/tmp/infershape_debug.log", "w");
+            if (f) {
+                fprintf(f, "[DEBUG] InferShape called\n");
+                fclose(f);
+            }
+        }
+    }
     // 输出按 max_voxels 容量分配（M 为运行期数据相关值，由 num_voxels[0] 给出）
     const gert::RuntimeAttrs* attrs = context->GetAttrs();
+    if (attrs == nullptr) {
+        FILE* f = fopen("/tmp/infershape_debug.log", "a");
+        if (f) { fprintf(f, "[DEBUG] InferShape: attrs is null\n"); fclose(f); }
+        return ge::GRAPH_FAILED;
+    }
     const int64_t* maxNumPtsAttr = attrs->GetInt(2);
     const int64_t* maxVoxelsAttr = attrs->GetInt(3);
     int64_t maxV = (maxVoxelsAttr != nullptr) ? *maxVoxelsAttr : 40000;
     int64_t maxP = (maxNumPtsAttr != nullptr) ? *maxNumPtsAttr : 32;
+    {
+        FILE* f = fopen("/tmp/infershape_debug.log", "a");
+        if (f) { fprintf(f, "[DEBUG] InferShape: maxV=%ld, maxP=%ld, maxNumPtsAttr=%p, maxVoxelsAttr=%p\n", maxV, maxP, (void*)maxNumPtsAttr, (void*)maxVoxelsAttr); fclose(f); }
+    }
 
     gert::Shape* voxels_shape = context->GetOutputShape(0);
+    if (voxels_shape == nullptr) {
+        FILE* f = fopen("/tmp/infershape_debug.log", "a");
+        if (f) { fprintf(f, "[DEBUG] InferShape: voxels_shape is null\n"); fclose(f); }
+        return ge::GRAPH_FAILED;
+    }
     voxels_shape->SetDimNum(3);
     voxels_shape->SetDim(0, maxV);
     voxels_shape->SetDim(1, maxP);
     voxels_shape->SetDim(2, 4);
 
     gert::Shape* coords_shape = context->GetOutputShape(1);
+    if (coords_shape == nullptr) {
+        FILE* f = fopen("/tmp/infershape_debug.log", "a");
+        if (f) { fprintf(f, "[DEBUG] InferShape: coords_shape is null\n"); fclose(f); }
+        return ge::GRAPH_FAILED;
+    }
     coords_shape->SetDimNum(2);
     coords_shape->SetDim(0, maxV);
     coords_shape->SetDim(1, 3);
 
     gert::Shape* num_points_shape = context->GetOutputShape(2);
+    if (num_points_shape == nullptr) {
+        FILE* f = fopen("/tmp/infershape_debug.log", "a");
+        if (f) { fprintf(f, "[DEBUG] InferShape: num_points_shape is null\n"); fclose(f); }
+        return ge::GRAPH_FAILED;
+    }
     num_points_shape->SetDimNum(1);
     num_points_shape->SetDim(0, maxV);
 
     gert::Shape* num_voxels_shape = context->GetOutputShape(3);
+    if (num_voxels_shape == nullptr) {
+        FILE* f = fopen("/tmp/infershape_debug.log", "a");
+        if (f) { fprintf(f, "[DEBUG] InferShape: num_voxels_shape is null\n"); fclose(f); }
+        return ge::GRAPH_FAILED;
+    }
     num_voxels_shape->SetDimNum(1);
     num_voxels_shape->SetDim(0, 1);
+    {
+        FILE* f = fopen("/tmp/infershape_debug.log", "a");
+        if (f) { fprintf(f, "[DEBUG] InferShape: SUCCESS\n"); fclose(f); }
+    }
     return GRAPH_SUCCESS;
 }
 
@@ -187,3 +233,7 @@ public:
 OP_ADD(Voxelization);
 
 }  // namespace ops
+
+IMPL_OP_INFERSHAPE(Voxelization)
+    .InferShape(ge::InferShape)
+    .InferDataType(ge::InferDataType);

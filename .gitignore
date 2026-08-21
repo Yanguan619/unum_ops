@@ -14,3 +14,6 @@ csrc/ascend/voxelization/test/data/output/
 test/build/
 csrc/ascend/custom_op_temp/
 session-unum_ops_vox.md
+op_extension/build/
+test/build/
+check_result.json

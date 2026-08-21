@@ -449,7 +449,48 @@ public:
             AscendC::PipeBarrier<PIPE_ALL>();
 
             for (uint32_t i = 0; i < cnt; i++) {
-                // PROCESS-LOOP-DISABLED-FOR-PROFILE
+                int32_t b = bin.GetValue(i);
+                int32_t xv = xi.GetValue(i);
+                int32_t yv = yi.GetValue(i);
+                int32_t zv = zi.GetValue(i);
+                if (!IsPointValid(off, i, n, xv, yv, zv)) continue;
+                if (b < (int32_t)startBin_ || b >= (int32_t)endBin_) continue;
+                uint32_t blkBase = (uint32_t)b & ~7u;
+                AscendC::DataCopy(vidBlk, vidGm_[blkBase], 8);
+                AscendC::PipeBarrier<PIPE_ALL>();
+                int32_t vid = vidBlk.GetValue((uint32_t)b - blkBase);
+                if (vid < 0) continue;
+                int32_t pos = posBlk.GetValue(i);
+                if (pos < (int32_t)maxPts) {
+                    float xvF = xt.GetValue(i);
+                    float yvF = yt.GetValue(i);
+                    float zvF = zt.GetValue(i);
+                    float iv = it.GetValue(i);
+                    __gm__ float* vp = voxPtr_ + ((uint64_t)vid * maxPts + pos) * 4;
+                    vp[0] = xvF;
+                    vp[1] = yvF;
+                    vp[2] = zvF;
+                    vp[3] = iv;
+                    if (pos == 0) {
+                        // 读 localCnt 得到 cntV，打包到 scratch 槽位（MTE3 写 32B 单槽）。
+                        // 不再直接标量写 coords/npts 输出：多核并发写同一 32B 缓存行会丢写。
+                        AscendC::DataCopy(cntBlk, localCntGm_[blkBase], 8);
+                        AscendC::PipeBarrier<PIPE_ALL>();
+                        int32_t cntV = cntBlk.GetValue((uint32_t)b - blkBase);
+                        cntV = (cntV < (int32_t)maxPts) ? cntV : (int32_t)maxPts;
+                        // 槽位 [vid, zv, yv, xv, cntV, 0, 0, 0]，vid 唯一 → 无跨核写竞争
+                        cntBlk.SetValue(0, vid);
+                        cntBlk.SetValue(1, zv);
+                        cntBlk.SetValue(2, yv);
+                        cntBlk.SetValue(3, xv);
+                        cntBlk.SetValue(4, cntV);
+                        cntBlk.SetValue(5, 0);
+                        cntBlk.SetValue(6, 0);
+                        cntBlk.SetValue(7, 0);
+                        AscendC::DataCopy(scrGm_[(int64_t)vid * 8], cntBlk, 8);
+                        AscendC::PipeBarrier<PIPE_ALL>();
+                    }
+                }
             }
             AscendC::PipeBarrier<PIPE_ALL>();
         }
