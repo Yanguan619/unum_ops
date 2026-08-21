@@ -110,15 +110,14 @@ public:
         //   InitWorkspace/CountPoints/BlockCount   —— 只读写本核 bin 区间，无跨核依赖
         //   SyncAll                                —— blockSum 归约同步点（硬件跨核同步）
         //   AssignVoxelIds/ScatterPoints           —— 只读写本核区间 + 读全部 blockSum
-        //   SyncAll                                —— scatter 写入 scratch 的可见性同步点
-        //   WriteCoordsNpts                        —— 仅 core 0：单写者写 coords/npts 输出（避免多核并发写同一缓存行丢写）
+        //   WriteCoordsNpts                        —— 每核写自己 vid 区间输出，只读本核 scratch，无跨核依赖
         InitWorkspace();
         CountPoints();
         BlockCount();
         AscendC::SyncAll<true>();
         AssignVoxelIds();
         ScatterPoints();
-        AscendC::SyncAll<true>();
+        // 不需要第二次 SyncAll：每个核写自己 vid 区间的 coords/npts 输出，只读自己写的 scratch
         WriteCoordsNpts();
     }
 
@@ -496,28 +495,36 @@ public:
         }
     }
 
-    // 仅 core 0：单写者最终写 coords/npts 输出。
-    // 读取各核在 ScatterPoints 写入 scratch 的槽位（MTE2），校验槽内 vid 后写输出。
-    // 单核标量写输出无跨核竞争，不会丢写（与原始单核版本一致）。
+    // 每个核写自己 vid 区间的 coords/npts 输出（单写者：不同核写不同 vid，无缓存行竞争）。
+    // 只读本核 ScatterPoints 写入的 scratch 槽位（同核 MTE3 写 → MTE2 读，缓存一致），
+    // 因此不需要第二次 SyncAll，从根上避免跨核 MTE3 写可见性问题。
     __aicore__ inline void WriteCoordsNpts()
     {
-        if (core_ != 0) return;
         AscendC::LocalTensor<int32_t> blk = bufT_.Get<int32_t>();
-        // MTE2 读 blockSum 重建 M（WriteCoordsNpts 是独立方法，标量读/标量写不可靠）
+        // MTE2 读全部 blockSum
         uint32_t bsFloats = ((t_->blockNum * 8) + 7u) & ~7u;
         AscendC::DataCopy(blk, blockSumGm_, bsFloats);
         AscendC::PipeBarrier<PIPE_ALL>();
-        uint32_t m = 0;
-        for (uint32_t c = 0; c < t_->blockNum; c++) m += (uint32_t)blk.GetValue(c * 8);
-        m = VoxMinU(m, t_->maxVoxels);
-        // 每 8 个槽位（8×32B=256B）一批读入，减少同步开销
-        for (uint32_t v = 0; v < m; v += 8) {
-            uint32_t cnt8 = VoxMinU(8, m - v);
+        uint32_t blockOff = 0;
+        uint32_t total = 0;
+        for (uint32_t c = 0; c < t_->blockNum; c++) {
+            uint32_t s = (uint32_t)blk.GetValue(c * 8);
+            if (c < core_) blockOff += s;
+            total += s;
+        }
+        total = VoxMinU(total, t_->maxVoxels);
+        if (core_ == 0) {
+            numVoxelsPtr_[0] = (int32_t)total;
+        }
+        // 本核 vid 区间 [blockOff, blockOff + myCount)
+        uint32_t myCount = VoxMinU((uint32_t)blk.GetValue(core_ * 8), total - blockOff);
+        for (uint32_t v = blockOff; v < blockOff + myCount; v += 8) {
+            uint32_t cnt8 = VoxMinU(8, blockOff + myCount - v);
             AscendC::DataCopy(blk, scrGm_[(int64_t)v * 8], (int32_t)(cnt8 * 8));
             AscendC::PipeBarrier<PIPE_ALL>();
             for (uint32_t j = 0; j < cnt8; j++) {
                 int32_t vid = blk.GetValue((int32_t)j * 8);
-                if (vid != (int32_t)(v + j)) continue;  // 槽位未写（安全兜底）
+                if (vid != (int32_t)(v + j)) continue;  // 槽位未写（maxVoxels 截断）
                 int32_t zv = blk.GetValue((int32_t)j * 8 + 1);
                 int32_t yv = blk.GetValue((int32_t)j * 8 + 2);
                 int32_t xv = blk.GetValue((int32_t)j * 8 + 3);

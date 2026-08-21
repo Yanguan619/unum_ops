@@ -86,11 +86,8 @@ def voxelization(
     pcr=DEFAULT_PCR,
     max_num_points: int = DEFAULT_MAX_NUM_POINTS,
     max_voxels: int = DEFAULT_MAX_VOXELS,
-    max_retries: int = 3,
 ) -> VoxelizationOutput:
     """在 NPU 上执行 voxelization。
-
-    注：310P Warning 态下多核硬件同步偶发失败（~40%），内部自动重试。
 
     Args:
         points: (N, 4) float32, NPU 上的点云 (x, y, z, intensity)
@@ -98,32 +95,25 @@ def voxelization(
         pcr: (x_min, y_min, z_min, x_max, y_max, z_max) 点云范围
         max_num_points: 每个 voxel 最多点数
         max_voxels: 最大 voxel 数
-        max_retries: 同步失败时的最大重试次数
 
     Returns:
         VoxelizationOutput（可解包为 voxels, coords, num_points, num_voxels）
     """
     _ensure_loaded()
-    for attempt in range(max_retries + 1):
-        raw = torch.ops.npu.voxelization(
-            points,
-            list(voxel_size),
-            list(pcr),
-            int(max_num_points),
-            int(max_voxels),
-        )
-        num_voxels = int(raw[3].item())
-        # 检测同步失败：npts 中不应有 0（非空 voxel 至少 1 点）
-        if attempt < max_retries and num_voxels > 0:
-            if (raw[2][:num_voxels] == 0).any():
-                torch.npu.synchronize()
-                continue
-        return VoxelizationOutput(
-            voxels=raw[0][:num_voxels],
-            coords=raw[1][:num_voxels],
-            num_points=raw[2][:num_voxels],
-            num_voxels=num_voxels,
-        )
+    raw = torch.ops.npu.voxelization(
+        points,
+        list(voxel_size),
+        list(pcr),
+        int(max_num_points),
+        int(max_voxels),
+    )
+    num_voxels = int(raw[3].item())
+    return VoxelizationOutput(
+        voxels=raw[0][:num_voxels],
+        coords=raw[1][:num_voxels],
+        num_points=raw[2][:num_voxels],
+        num_voxels=num_voxels,
+    )
 
 
 __all__ = ["voxelization", "VoxelizationOutput"]
