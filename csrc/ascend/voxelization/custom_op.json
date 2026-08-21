@@ -1,0 +1,82 @@
+[
+    {
+        "op": "Voxelization",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "points",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float32"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "voxels",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float32"
+                ]
+            },
+            {
+                "name": "coords",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32"
+                ]
+            },
+            {
+                "name": "num_points",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32"
+                ]
+            },
+            {
+                "name": "num_voxels",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32"
+                ]
+            }
+        ],
+        "attr": [
+            {
+                "name": "voxel_size",
+                "param_type": "required",
+                "type": "list_float"
+            },
+            {
+                "name": "point_cloud_range",
+                "param_type": "required",
+                "type": "list_float"
+            },
+            {
+                "name": "max_num_points",
+                "param_type": "required",
+                "type": "int"
+            },
+            {
+                "name": "max_voxels",
+                "param_type": "required",
+                "type": "int"
+            }
+        ]
+    }
+]

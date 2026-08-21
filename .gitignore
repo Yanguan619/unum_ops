@@ -3,3 +3,12 @@
 .benchmarks
 .ruff_cache
 __pycache__
+
+# Ascend op build artifacts
+build_out/
+csrc/ascend/custom_op/build/
+__pycache__/
+*.run
+csrc/ascend/voxelization/test/data/output/
+*.om
+test/build/
