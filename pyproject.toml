@@ -7,7 +7,20 @@ authors = [
     { name = "Yanguan02", email = "yanguan_02@126.com" }
 ]
 requires-python = ">=3.11, <3.12"
-dependencies = [
+dynamic = ["dependencies"]
+
+[project.scripts]
+unum_ops = "unum_ops:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata.hooks.custom]
+path = "hatch_build.py"
+
+[tool.unum_ops.dependencies]
+base = [
     "absl-py>=2.5.0",
     "attrs>=26.1.0",
     "cffi>=2.1.1",
@@ -23,15 +36,8 @@ dependencies = [
     "scipy>=1.17.1",
     "torch==2.7.1",
     "torch-npu==2.7.1",
-    "triton>=3.2.0",
 ]
-
-[project.scripts]
-unum_ops = "unum_ops:main"
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+triton = "triton>=3.2.0"
 
 [tool.uv.sources]
 torch = { index = "pytorch" }

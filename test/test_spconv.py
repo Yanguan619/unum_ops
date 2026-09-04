@@ -132,6 +132,7 @@ def ref_build_coord_dict(indices):
 
 def ref_subm(conv, x):
     indices = x.indices
+    spatial_shape = tuple(x.spatial_shape[:conv.ndim])
     coord_to_idx = ref_build_coord_dict(indices)
     N, C_out = x.features.shape[0], conv.out_channels
     w_flat = conv.weight.reshape(conv.out_channels, conv.in_channels, -1)
@@ -142,8 +143,17 @@ def ref_subm(conv, x):
         coord = inds[i]
         acc = torch.zeros(C_out)
         for off, k in zip(conv._kernel_offsets(), conv._flat_slice_idx):
-            ncoord = (coord[0],) + tuple(coord[d + 1] + off[d] for d in range(conv.ndim))
-            j = coord_to_idx.get(ncoord)
+            valid = True
+            ncoord = [coord[0]]
+            for d in range(conv.ndim):
+                src = coord[d + 1] * conv.stride[d] + off[d] * conv.dilation[d] - conv.padding[d]
+                if src < 0 or src >= spatial_shape[d]:
+                    valid = False
+                    break
+                ncoord.append(src)
+            if not valid:
+                continue
+            j = coord_to_idx.get(tuple(ncoord))
             if j is not None:
                 acc += w_flat[:, :, k] @ x.features[j]
         if bias is not None:

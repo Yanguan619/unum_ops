@@ -207,7 +207,7 @@ class SparseConv3dAdapter(SparseModule):
     def __init__(self, in_channels, out_channels, kernel_size,
                  stride=1, padding=0, bias=True):
         super().__init__()
-        from spconv.conv import SparseConv3d as SparseConv3dCPU
+        from .conv import SparseConv3d as SparseConv3dCPU
         self.conv = SparseConv3dCPU(
             in_channels, out_channels, kernel_size,
             stride=stride, padding=padding, bias=bias
@@ -224,7 +224,7 @@ class SubMConv3dAdapter(SparseModule):
     def __init__(self, in_channels, out_channels, kernel_size,
                  stride=1, padding=0, dilation=1, bias=True):
         super().__init__()
-        from spconv.conv import SubMConv3d as SubMConv3dCPU
+        from .conv import SubMConv3d as SubMConv3dCPU
         self.conv = SubMConv3dCPU(
             in_channels, out_channels, kernel_size,
             stride=stride, padding=padding,
