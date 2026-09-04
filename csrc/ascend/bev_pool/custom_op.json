@@ -1,0 +1,82 @@
+[
+    {
+        "op": "BevPool",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "feats",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float32"
+                ]
+            },
+            {
+                "name": "coords",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32"
+                ]
+            },
+            {
+                "name": "interval_starts",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32"
+                ]
+            },
+            {
+                "name": "interval_lengths",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "out",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float32"
+                ]
+            }
+        ],
+        "attr": [
+            {
+                "name": "batch",
+                "param_type": "required",
+                "type": "int"
+            },
+            {
+                "name": "depth",
+                "param_type": "required",
+                "type": "int"
+            },
+            {
+                "name": "height",
+                "param_type": "required",
+                "type": "int"
+            },
+            {
+                "name": "width",
+                "param_type": "required",
+                "type": "int"
+            }
+        ]
+    }
+]
