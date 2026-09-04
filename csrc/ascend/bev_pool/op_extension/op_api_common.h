@@ -128,8 +128,11 @@ extern thread_local int g_hashOffset;
   _(at::ScalarType::Undefined, ACL_DT_UNDEFINED)    \
   _(at::ScalarType::NumOptions, ACL_DT_UNDEFINED)
 
-constexpr aclDataType kATenScalarTypeToAclDataTypeTable
-    [static_cast<int64_t>(at::ScalarType::NumOptions) + 1] = {
+// 尺寸需覆盖下方宏生成的初始化器个数：本地 torch 的
+// at::ScalarType::NumOptions 比 vllm 编译时预期小，直接用 NumOptions+1
+// 作上界会触发 "too many initializers"。bev_pool 仅用到 Float(0)/Int(3)，
+// 索引远小于该上界，故用足够大的固定尺寸即可。
+constexpr aclDataType kATenScalarTypeToAclDataTypeTable[64] = {
 #define DEFINE_ENUM(_1, n) n,
         AT_ALL_SCALAR_TYPE_AND_ACL_DATATYPE_PAIR(DEFINE_ENUM)
 #undef DEFINE_ENUM

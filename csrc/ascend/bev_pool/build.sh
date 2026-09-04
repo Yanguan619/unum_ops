@@ -25,6 +25,7 @@ else
 fi
 echo "using ASCEND_HOME_PATH: $ASCEND_HOME_PATH"
 script_path=$(realpath $(dirname $0))
+cd "$script_path"
 
 BUILD_DIR="build_out"
 mkdir -p build_out

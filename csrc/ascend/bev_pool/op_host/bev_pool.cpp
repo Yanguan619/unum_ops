@@ -48,6 +48,13 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 
     uint32_t intervalsPerCore = (numIntervals + blockNum - 1) / blockNum;
 
+    // 块处理路径的块容量（行数）：按实际 C 自适应，尽量用满 UB chunk 预算。
+    // chunk 预算 ~ (128KB) / 4 字节 = 32768 float。
+    uint32_t tilePoints = (numChannels > 0) ? (32768u / numChannels) : 1;
+    tilePoints = (tilePoints < BEV_MAX_TILE_POINTS) ? tilePoints : BEV_MAX_TILE_POINTS;
+    if (tilePoints < 1) { tilePoints = 1; }
+    if (!channelAligned) { tilePoints = BEV_TILE_POINTS; }
+
     memset(tiling, 0, sizeof(BevPoolTilingData));
     tiling->numPoints = numPoints;
     tiling->numChannels = numChannels;
@@ -60,6 +67,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     tiling->intervalsPerCore = intervalsPerCore;
     tiling->blockNum = blockNum;
     tiling->channelAligned = channelAligned ? 1 : 0;
+    tiling->tilePoints = tilePoints;
 
     context->SetBlockDim(blockNum);
     size_t* ws = context->GetWorkspaceSizes(1);

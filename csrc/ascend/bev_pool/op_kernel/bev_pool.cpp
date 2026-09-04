@@ -34,15 +34,24 @@ public:
         featsGm_.SetGlobalBuffer(featsPtr_, (int64_t)tiling->numPoints * tiling->numChannels);
         outGm_.SetGlobalBuffer(outPtr_, (int64_t)tiling->gridTotal * tiling->numChannels);
 
-        pipe_->InitBuffer(bufAcc_, BEV_MAX_CHANNELS * sizeof(float));
-        pipe_->InitBuffer(bufChunk_, BEV_TILE_POINTS * BEV_MAX_CHANNELS * sizeof(float));
+        const uint32_t C = t_->numChannels;
+        pipe_->InitBuffer(bufAcc_, C * sizeof(float));
+        pipe_->InitBuffer(bufChunk_, (int64_t)t_->tilePoints * ((int64_t)t_->numChannels) * sizeof(float));
     }
 
     __aicore__ inline void Process()
     {
-        for (uint32_t iv = startInt_; iv < endInt_; iv++) {
-            ProcessInterval(iv);
+        if (!t_->channelAligned) {
+            for (uint32_t iv = startInt_; iv < endInt_; iv++) {
+                ProcessIntervalScalar(iv);
+            }
+            return;
         }
+        uint32_t iv = startInt_;
+        while (iv < endInt_) {
+            iv = ProcessBlock(iv);
+        }
+        AscendC::PipeBarrier<PIPE_ALL>();
     }
 
 private:
@@ -70,7 +79,8 @@ private:
         return true;
     }
 
-    __aicore__ inline void ProcessInterval(uint32_t iv)
+    // 标量路径：C 非 8 对齐时的正确性回退，单核。
+    __aicore__ inline void ProcessIntervalScalar(uint32_t iv)
     {
         int32_t start = startsPtr_[iv];
         int32_t length = lengthsPtr_[iv];
@@ -80,47 +90,123 @@ private:
         if (!InBounds((uint32_t)start)) {
             return;
         }
-
         uint64_t outOff = OutputOffset((uint32_t)start);
         uint32_t C = t_->numChannels;
+        __gm__ float* dst = outPtr_ + outOff;
+        for (uint32_t c = 0; c < C; c++) {
+            dst[c] = 0.0f;
+        }
+        AscendC::PipeBarrier<PIPE_ALL>();
+        for (int32_t r = 0; r < length; r++) {
+            const __gm__ float* row = featsPtr_ + (int64_t)(start + r) * C;
+            for (uint32_t c = 0; c < C; c++) {
+                dst[c] += row[c];
+            }
+        }
+        AscendC::PipeBarrier<PIPE_ALL>();
+    }
+
+    // 块处理（对齐向量化路径）：
+    // 排序后的 feats 中，连续 interval 的点行在 GM 上连续 → 一个块可用一次
+    // 大的 DataCopy 装载多行，避免每 interval 一次小的 GM 读（延迟受限主因）。
+    // OOB interval 的行也占据 GM 空间，必须计入 rowOff 以保持 DataCopy 的连续性。
+    // 返回下一个待处理的 interval 下标。
+    __aicore__ inline uint32_t ProcessBlock(uint32_t iv0)
+    {
+        const uint32_t C = t_->numChannels;
+        const uint32_t cap = t_->tilePoints;
+        AscendC::LocalTensor<float> chunk = bufChunk_.Get<float>();
         AscendC::LocalTensor<float> acc = bufAcc_.Get<float>();
 
-        if (t_->channelAligned) {
-            AscendC::LocalTensor<float> chunk = bufChunk_.Get<float>();
-            AscendC::Duplicate<float>(acc, 0.0f, (int32_t)C);
-            AscendC::PipeBarrier<PIPE_ALL>();
-
-            int32_t rowBase = start;
-            int32_t rowsLeft = length;
-            while (rowsLeft > 0) {
-                uint32_t t = BevMinU(BEV_TILE_POINTS, (uint32_t)rowsLeft);
-                AscendC::DataCopy(chunk, featsGm_[(int64_t)rowBase * C], (int32_t)(t * C));
-                AscendC::PipeBarrier<PIPE_ALL>();
-                for (uint32_t i = 0; i < t; i++) {
-                    AscendC::Add(acc, acc, chunk[i * C], (int32_t)C);
-                }
-                AscendC::PipeBarrier<PIPE_ALL>();
-                rowBase += (int32_t)t;
-                rowsLeft -= (int32_t)t;
+        // ---- Load phase: 累积连续 interval 的点行直到块容量 ----
+        // 所有 ln > 0 的 interval（包括 OOB）都计入 rowOff，
+        // 因为它们的行在 GM 中连续排列。
+        uint32_t iv = iv0;
+        int64_t rowOff = 0;
+        int64_t firstStart = -1;
+        while (iv < endInt_) {
+            int32_t s = startsPtr_[iv];
+            int32_t ln = lengthsPtr_[iv];
+            if (ln <= 0) {
+                iv++;
+                continue;
             }
-            AscendC::DataCopy(outGm_[outOff], acc, (int32_t)C);
-            AscendC::PipeBarrier<PIPE_ALL>();
-        } else {
-            // 标量路径：C 非 8 对齐时的正确性回退。
-            // 直接在 GM 上累加，避免 VECCAL 位置 UB 的 GetValue/SetValue 在 310P 上非确定。
-            __gm__ float* dst = outPtr_ + outOff;
-            for (uint32_t c = 0; c < C; c++) {
-                dst[c] = 0.0f;
+            if (firstStart < 0) {
+                firstStart = s;
             }
-            AscendC::PipeBarrier<PIPE_ALL>();
-            for (int32_t r = 0; r < length; r++) {
-                const __gm__ float* row = featsPtr_ + (int64_t)(start + r) * C;
-                for (uint32_t c = 0; c < C; c++) {
-                    dst[c] += row[c];
-                }
+            if ((int64_t)ln > (int64_t)cap - rowOff) {
+                break;
             }
-            AscendC::PipeBarrier<PIPE_ALL>();
+            rowOff += ln;
+            iv++;
         }
+        if (rowOff == 0) {
+            // 首 interval 就超容量（或全为空）→ 单独处理这个大 interval。
+            return ProcessLargeInterval(iv0);
+        }
+
+        // 单次大 DataCopy 装载整个块的多行（连续 GM 区域，含 OOB 行）。
+        AscendC::DataCopy(chunk, featsGm_[(int64_t)firstStart * C], (int32_t)(rowOff * C));
+        AscendC::PipeBarrier<PIPE_ALL>();
+
+        // ---- Compute phase: 逐 interval 在 UB 内累加并写出 ----
+        // coff 对所有 ln > 0 的 interval 前进（包括 OOB），保持与 chunk 内行偏移对齐。
+        // 仅 in-bounds interval 执行累加 + 写出；OOB interval 跳过累加但仍前进 coff。
+        int64_t coff = 0;
+        for (uint32_t j = iv0; j < iv; j++) {
+            int32_t s = startsPtr_[j];
+            int32_t ln = lengthsPtr_[j];
+            if (ln <= 0) {
+                continue;
+            }
+            if (InBounds((uint32_t)s)) {
+                uint64_t outOff = OutputOffset((uint32_t)s);
+                AscendC::Duplicate<float>(acc, 0.0f, (int32_t)C);
+                AscendC::PipeBarrier<PIPE_ALL>();
+                for (int32_t r = 0; r < ln; r++) {
+                    AscendC::Add(acc, acc, chunk[(int64_t)(coff + r) * C], (int32_t)C);
+                }
+                AscendC::PipeBarrier<PIPE_ALL>();
+                AscendC::DataCopy(outGm_[outOff], acc, (int32_t)C);
+                AscendC::PipeBarrier<PIPE_ALL>();
+            }
+            coff += ln;
+        }
+        AscendC::PipeBarrier<PIPE_MTE3>();
+        return iv;
+    }
+
+    // 单个超大 interval（长度超过块容量）：分片装载累加。
+    __aicore__ inline uint32_t ProcessLargeInterval(uint32_t iv)
+    {
+        const uint32_t C = t_->numChannels;
+        const uint32_t cap = t_->tilePoints;
+        int32_t start = startsPtr_[iv];
+        int32_t length = lengthsPtr_[iv];
+        if (length <= 0 || !InBounds((uint32_t)start)) {
+            return iv + 1;
+        }
+        uint64_t outOff = OutputOffset((uint32_t)start);
+        AscendC::LocalTensor<float> chunk = bufChunk_.Get<float>();
+        AscendC::LocalTensor<float> acc = bufAcc_.Get<float>();
+        AscendC::Duplicate<float>(acc, 0.0f, (int32_t)C);
+        AscendC::PipeBarrier<PIPE_V>();
+        int32_t rowBase = start;
+        int32_t rowsLeft = length;
+        while (rowsLeft > 0) {
+            uint32_t tt = BevMinU(cap, (uint32_t)rowsLeft);
+            AscendC::DataCopy(chunk, featsGm_[(int64_t)rowBase * C], (int32_t)(tt * C));
+            AscendC::PipeBarrier<PIPE_MTE2>();
+            for (uint32_t i = 0; i < tt; i++) {
+                AscendC::Add(acc, acc, chunk[i * C], (int32_t)C);
+            }
+            AscendC::PipeBarrier<PIPE_V>();
+            rowBase += (int32_t)tt;
+            rowsLeft -= (int32_t)tt;
+        }
+        AscendC::DataCopy(outGm_[outOff], acc, (int32_t)C);
+        AscendC::PipeBarrier<PIPE_MTE3>();
+        return iv + 1;
     }
 
 private:

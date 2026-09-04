@@ -3,6 +3,7 @@
 #include <dlfcn.h>
 #include <torch/extension.h>
 #include "torch_npu/csrc/core/npu/NPUStream.h"
+#include "torch_npu/csrc/framework/OpCommand.h"
 #include "bev_pool_ops.h"
 
 namespace {
@@ -14,7 +15,6 @@ typedef void* aclrtStream;
 constexpr int kAclFloat = 0;
 constexpr int kAclInt32 = 3;
 constexpr int kAclFormatNd = 2;
-constexpr uint32_t kAclMemMallocHugeFirst = 0;
 
 typedef int (*GetWorkspaceSizeFunc)(const aclTensor*, const aclTensor*, const aclTensor*,
                                     const aclTensor*, int64_t, int64_t, int64_t, int64_t,
@@ -24,19 +24,12 @@ typedef aclTensor* (*CreateTensorFunc)(const int64_t*, uint64_t, int,
                                        const int64_t*, int64_t, int,
                                        const int64_t*, uint64_t, void*);
 typedef int (*DestroyTensorFunc)(const aclTensor*);
-typedef int (*RtMallocFunc)(void**, uint64_t, uint32_t);
-typedef int (*RtFreeFunc)(void*);
-typedef int (*RtSyncFunc)(aclrtStream);
 
 struct AclnnFuncs {
     GetWorkspaceSizeFunc getWorkspaceSize = nullptr;
     RunFunc run = nullptr;
     CreateTensorFunc createTensor = nullptr;
     DestroyTensorFunc destroyTensor = nullptr;
-    RtMallocFunc rtMalloc = nullptr;
-    RtFreeFunc rtFree = nullptr;
-    RtSyncFunc rtSync = nullptr;
-    void (*executorClear)(void*) = nullptr;
     bool loaded = false;
 };
 
@@ -57,32 +50,26 @@ AclnnFuncs& GetAclnnFuncs() {
         if (nnop) {
             funcs.createTensor = Dlsym<CreateTensorFunc>(nnop, "aclCreateTensor");
             funcs.destroyTensor = Dlsym<DestroyTensorFunc>(nnop, "aclDestroyTensor");
-            funcs.executorClear = Dlsym<void (*)(void*)>(nnop, "NnopbaseExecutorClear");
-        }
-        void* rt = dlopen("libascendcl.so", RTLD_LAZY | RTLD_LOCAL);
-        if (rt) {
-            funcs.rtMalloc = Dlsym<RtMallocFunc>(rt, "aclrtMalloc");
-            funcs.rtFree = Dlsym<RtFreeFunc>(rt, "aclrtFree");
-            funcs.rtSync = Dlsym<RtSyncFunc>(rt, "aclrtSynchronizeStream");
         }
         funcs.loaded = true;
     }
     return funcs;
 }
 
-aclTensor* MakeTensor(int dataType, const std::vector<int64_t>& shape,
-                      void* storageData, int64_t storageOffset = 0) {
+// 仿照 vllm-ascend ConvertType：把 at::Tensor 的实际 storage 直接包装成
+// aclTensor（无 D2D 拷贝）。sizes()/strides() 返回的 IntArrayRef 由
+// tensor 内部存储支撑，tensor 存活期间指针有效。
+// storageDims 用栈上局部变量，aclCreateTensor 会拷贝。
+aclTensor* WrapTensor(const at::Tensor& t, int acl_dtype) {
     auto& funcs = GetAclnnFuncs();
-    int64_t ndim = shape.size();
-    std::vector<int64_t> strides(ndim);
-    int64_t s = 1;
-    for (int i = ndim - 1; i >= 0; i--) {
-        strides[i] = s;
-        s *= shape[i];
-    }
-    return funcs.createTensor(shape.data(), ndim, dataType, strides.data(),
-                              storageOffset, kAclFormatNd,
-                              shape.data(), ndim, storageData);
+    const auto& sizes = t.sizes();
+    const auto& strides = t.strides();
+    int64_t storageDim = t.storage().nbytes() / t.itemsize();
+    return funcs.createTensor(
+        sizes.data(), sizes.size(), acl_dtype,
+        strides.data(), t.storage_offset(), kAclFormatNd,
+        &storageDim, 1,
+        const_cast<void*>(t.storage().data()));
 }
 
 }  // namespace
@@ -95,76 +82,64 @@ BevPoolOutputs bev_pool(const at::Tensor& feats, const at::Tensor& coords,
                         int64_t batch, int64_t depth, int64_t height, int64_t width) {
     auto& funcs = GetAclnnFuncs();
     TORCH_CHECK(funcs.getWorkspaceSize && funcs.run && funcs.createTensor &&
-                    funcs.destroyTensor && funcs.rtMalloc && funcs.rtFree && funcs.rtSync,
+                    funcs.destroyTensor,
                 "aclnnBevPool symbols not found (install OPP package / CANN env)");
 
     auto N = feats.size(0);
     auto C = feats.size(1);
-    aclrtStream aclStream = c10_npu::getCurrentNPUStream().stream(false);
 
-    // 持久缓冲区：aclnn executor 是单例，缓存第一次调用的 tensor 地址。
-    // 地址固定则缓存命中时 kerne 读写正确地址；地址变化则需清缓存。
-    // 用 at::zeros 每次新建会导致地址变化 → 间歇性全零。
-    static at::Tensor bufFeats, bufCoords, bufStarts, bufLengths, bufOut;
-    bool shapeChanged = false;
-    auto ensure = [&](at::Tensor& t, const std::vector<int64_t>& s,
-                      at::ScalarType dt, const at::TensorOptions& opts) {
-        bool same = t.defined() && t.sizes().vec() == s && t.dtype() == dt;
-        if (!same) { t = torch::empty(s, opts.dtype(dt)); shapeChanged = true; }
-    };
-    auto opts = feats.options();
-    ensure(bufFeats, {N, C}, feats.scalar_type(), opts);
-    ensure(bufCoords, {N, 4}, coords.scalar_type(), opts);
-    ensure(bufStarts, {interval_starts.size(0)}, interval_starts.scalar_type(), opts);
-    ensure(bufLengths, {interval_lengths.size(0)}, interval_lengths.scalar_type(), opts);
-    ensure(bufOut, {batch, depth, height, width, C}, at::kFloat, opts);
-    bufFeats.copy_(feats); bufCoords.copy_(coords);
-    bufStarts.copy_(interval_starts); bufLengths.copy_(interval_lengths);
-    bufOut.zero_();
+    // 输出用 2D [gridTotal, C] 避免 W 非 8 对齐时 DataCopy 写出未对齐。
+    // kernel 按平坦 offset 写入，Python 层再 view+permute 回 [B,D,H,W,C]。
+    int64_t gridTotal = batch * depth * height * width;
+    at::Tensor out = at::zeros({gridTotal, C},
+                               feats.options().dtype(at::kFloat));
 
-    aclTensor* featsTensor = MakeTensor(kAclFloat, {N, C},
-        const_cast<void*>(bufFeats.storage().data()), bufFeats.storage_offset());
-    aclTensor* coordsTensor = MakeTensor(kAclInt32, {N, 4},
-        const_cast<void*>(bufCoords.storage().data()), bufCoords.storage_offset());
-    aclTensor* startsTensor = MakeTensor(kAclInt32, {interval_starts.size(0)},
-        const_cast<void*>(bufStarts.storage().data()), bufStarts.storage_offset());
-    aclTensor* lengthsTensor = MakeTensor(kAclInt32, {interval_lengths.size(0)},
-        const_cast<void*>(bufLengths.storage().data()), bufLengths.storage_offset());
-    aclTensor* outTensor = MakeTensor(kAclFloat, {batch, depth, height, width, C},
-        const_cast<void*>(bufOut.storage().data()), bufOut.storage_offset());
+    // 把用户 tensor 的实际 storage 传给 aclnn（不再拷贝进持久 buffer）。
+    // 用户 tensor 地址稳定 → aclnn 按地址缓存的 kernel 始终有效。
+    aclTensor* featsTensor = WrapTensor(feats, kAclFloat);
+    aclTensor* coordsTensor = WrapTensor(coords, kAclInt32);
+    aclTensor* startsTensor = WrapTensor(interval_starts, kAclInt32);
+    aclTensor* lengthsTensor = WrapTensor(interval_lengths, kAclInt32);
+    aclTensor* outTensor = WrapTensor(out, kAclFloat);
 
-    // 每次调用都清除 executor 缓存：persistent 缓冲区在 shape 变化时
-    // 会重分配（地址变化），不清除会导致 kernel 写到旧地址 → 全零。
-    // 每次清确保 getWorkspaceSize 用当前地址重建。
-
+    // 每次调用重建 fresh executor（不跨调用缓存），消除 stale-descriptor 全零问题。
     uint64_t workspaceSize = 0;
     aclOpExecutor* executor = nullptr;
-    int st = funcs.getWorkspaceSize(featsTensor, coordsTensor, startsTensor, lengthsTensor,
-                                    batch, depth, height, width, outTensor,
-                                    &workspaceSize, &executor);
+    int st = funcs.getWorkspaceSize(featsTensor, coordsTensor, startsTensor,
+                                    lengthsTensor, batch, depth, height, width,
+                                    outTensor, &workspaceSize, &executor);
     TORCH_CHECK(st == 0, "aclnnBevPoolGetWorkspaceSize failed: ", st);
 
-    void* wsDev = nullptr;
+    // workspace 用 NPU tensor（RAII，替代 aclrtMalloc/rtFree）。
+    void* wsAddr = nullptr;
+    at::Tensor wsTensor;
     if (workspaceSize > 0) {
-        funcs.rtMalloc(&wsDev, workspaceSize, kAclMemMallocHugeFirst);
+        wsTensor = at::empty({(int64_t)workspaceSize},
+                             feats.options().dtype(at::kByte));
+        wsAddr = const_cast<void*>(wsTensor.storage().data());
     }
 
-    st = funcs.run(wsDev, workspaceSize, executor, aclStream);
-    TORCH_CHECK(st == 0, "aclnnBevPool failed: ", st);
-    funcs.rtSync(aclStream);
+    auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
 
-    // shape 变化 → 缓冲区重分配 → 地址变化 → 清除 executor 缓存
-    // 使下次 getWorkspaceSize 用当前地址重建
-    if (funcs.executorClear) {
-        funcs.executorClear(executor);
-    }
+    // 通过 OpCommand 提交，融入 torch_npu stream 异步执行顺序。
+    // lambda 按值捕获（仿照 vllm-ascend EXEC_NPU_CMD），避免引用悬空。
+    at_npu::native::OpCommand cmd;
+    cmd.Name("aclnnBevPool");
+    cmd.SetCustomHandler(
+        [funcs, wsAddr, workspaceSize, executor, aclStream,
+         featsTensor, coordsTensor, startsTensor, lengthsTensor, outTensor]() -> int {
+            int ret = funcs.run(wsAddr, workspaceSize, executor, aclStream);
+            TORCH_CHECK(ret == 0, "aclnnBevPool failed: ", ret);
+            funcs.destroyTensor(featsTensor);
+            funcs.destroyTensor(coordsTensor);
+            funcs.destroyTensor(startsTensor);
+            funcs.destroyTensor(lengthsTensor);
+            funcs.destroyTensor(outTensor);
+            return ret;
+        });
+    cmd.Run();
 
-    funcs.destroyTensor(featsTensor); funcs.destroyTensor(coordsTensor);
-    funcs.destroyTensor(startsTensor); funcs.destroyTensor(lengthsTensor);
-    funcs.destroyTensor(outTensor);
-    if (wsDev) funcs.rtFree(wsDev);
-
-    return {bufOut.clone()};
+    return {out};
 }
 
 }  // namespace ascend_kernel

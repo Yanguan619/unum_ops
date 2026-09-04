@@ -17,6 +17,7 @@
 constexpr uint32_t BEV_TILE_POINTS = 32;
 constexpr uint32_t BEV_MAX_CHANNELS = 512;
 constexpr uint32_t BEV_MAX_CORES = 8;
+constexpr uint32_t BEV_MAX_TILE_POINTS = 256;
 
 struct BevPoolTilingData {
     // --- 12×uint32 (48 bytes) ---
@@ -31,7 +32,7 @@ struct BevPoolTilingData {
     uint32_t intervalsPerCore; // ceil(K / blockNum)
     uint32_t blockNum;         // 实际核数
     uint32_t channelAligned;   // 1 表示 C % 8 == 0（向量化路径），0 表示标量路径
-    uint32_t pad;              // 填充对齐
+    uint32_t tilePoints;       // 每块加载的点数（块处理路径的容量，按 C 自适应）
 };
 
 static_assert(sizeof(BevPoolTilingData) == 48, "BevPoolTilingData must be 48 bytes");

@@ -99,8 +99,8 @@ def bev_pool(feats, coords, B, D, H, W):
         return BevPoolOutput(out=out)
 
     ranks = (
-        coords[:, 0] * (W * D * B) + coords[:, 1] * (D * B) +
-        coords[:, 2] * B + coords[:, 3])
+        coords[:, 0] + coords[:, 1] * W + coords[:, 2] * (W * H) +
+        coords[:, 3] * (W * H * D))
     indices = ranks.float().argsort()
     feats = feats[indices].contiguous()
     coords = coords[indices].int().contiguous()
@@ -123,7 +123,7 @@ def bev_pool(feats, coords, B, D, H, W):
         int(H),
         int(W),
     )
-    out = out.permute(0, 4, 1, 2, 3).contiguous()
+    out = out.view(B, D, H, W, C).permute(0, 4, 1, 2, 3).contiguous()
     return BevPoolOutput(out=out)
 
 
