@@ -239,7 +239,7 @@ class SparseConvolution(SparseModule):
         N, K = neighbor_idx.shape
         C_in = features.shape[1]
         C_out = self.out_channels
-        if N == 0:
+        if N == 0 or features.shape[0] == 0:
             return features.new_zeros(0, C_out)
         wT = self._wT  # (K, C_in, C_out)
 

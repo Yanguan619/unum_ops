@@ -17,11 +17,26 @@ class VoxelGeneratorV2:
         self.point_cloud_range = np.asarray(point_cloud_range, dtype=np.float32)
         self.max_num_points = int(max_num_points)
         self.max_voxels = int(max_voxels)
-        self._grid_size = ((self.point_cloud_range[3:] - self.point_cloud_range[:3]) /
-                           self.voxel_size).astype(np.int32)
+        if self.point_cloud_range.shape[0] != 6:
+            raise ValueError(
+                f"point_cloud_range must have 6 elements (x,y,z,x_max,y_max,z_max), "
+                f"got {self.point_cloud_range.shape[0]}")
+        if np.any(self.voxel_size <= 0):
+            raise ValueError(f"voxel_size must be positive, got {voxel_size}")
+        if self.max_num_points <= 0 or self.max_voxels <= 0:
+            raise ValueError(
+                f"max_num_points and max_voxels must be positive, "
+                f"got {max_num_points}, {max_voxels}")
+        span = self.point_cloud_range[3:] - self.point_cloud_range[:3]
+        self._grid_size = np.ceil(span / self.voxel_size).astype(np.int32)
 
     def generate(self, points):
         points = np.asarray(points, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] < 3:
+            raise ValueError(
+                f"points must be 2D with >=3 columns [x,y,z,...], got shape {points.shape}")
+        feat_dim = points.shape[1]
+
         coords = np.floor((points[:, :3] - self.point_cloud_range[:3]) / self.voxel_size).astype(np.int32)
 
         valid = np.all(coords >= 0, axis=1) & np.all(coords < self._grid_size, axis=1)
@@ -31,13 +46,13 @@ class VoxelGeneratorV2:
         # 空输入处理
         if len(points) == 0:
             return {
-                'voxels': np.zeros((0, self.max_num_points, 4), dtype=np.float32),
+                'voxels': np.zeros((0, self.max_num_points, feat_dim), dtype=np.float32),
                 'coordinates': np.zeros((0, 3), dtype=np.int32),
                 'num_points_per_voxel': np.zeros((0,), dtype=np.int32),
             }
 
-        # spconv 1.x 使用 z 优先的字典序排序
-        sort_idx = np.lexsort((coords[:, 2], coords[:, 1], coords[:, 0]))
+        # spconv 1.x 使用 z 优先的字典序排序（lexsort 以最后一个 key 为主，故 z 放最后）
+        sort_idx = np.lexsort((coords[:, 0], coords[:, 1], coords[:, 2]))
         points = points[sort_idx]
         coords = coords[sort_idx]
 

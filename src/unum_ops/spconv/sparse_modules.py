@@ -68,9 +68,11 @@ class SparseConvTensor:
         B = self.batch_size
 
         if channels_first:
-            dense = torch.zeros((B, C, *spatial), dtype=self.features.dtype)
+            dense = torch.zeros((B, C, *spatial), dtype=self.features.dtype,
+                                device=self.features.device)
         else:
-            dense = torch.zeros((B, *spatial, C), dtype=self.features.dtype)
+            dense = torch.zeros((B, *spatial, C), dtype=self.features.dtype,
+                                device=self.features.device)
 
         indices = self.indices.long()
         for i in range(N):
@@ -78,11 +80,12 @@ class SparseConvTensor:
             sp = [indices[i, d + 1].item() for d in range(self.ndim)]
             if any(sp[d] >= spatial[d] or sp[d] < 0 for d in range(self.ndim)):
                 continue
-            if b < B:
-                if channels_first:
-                    dense[(b, slice(None), *sp)] = self.features[i]
-                else:
-                    dense[(b, *sp, slice(None))] = self.features[i]
+            if b < 0 or b >= B:
+                continue
+            if channels_first:
+                dense[(b, slice(None), *sp)] = self.features[i]
+            else:
+                dense[(b, *sp, slice(None))] = self.features[i]
 
         return dense
 
@@ -111,11 +114,12 @@ class SparseConvTensor:
                     features_list.append(dense[b, x, y, z, :])
 
         if features_list:
-            indices = torch.tensor(indices_list, dtype=torch.int32)
+            indices = torch.tensor(indices_list, dtype=torch.int32, device=dense.device)
             features = torch.stack(features_list).float()
         else:
-            indices = torch.empty(0, 4, dtype=torch.int32)
-            features = torch.empty(0, C if channels_first else dense.shape[-1])
+            indices = torch.empty(0, 4, dtype=torch.int32, device=dense.device)
+            features = torch.empty(0, C if channels_first else dense.shape[-1],
+                                   device=dense.device)
 
         return SparseConvTensor(features, indices, (D, H, W), B)
 
