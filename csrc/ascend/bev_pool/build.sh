@@ -38,3 +38,19 @@ else
     cmake -S . -B "$BUILD_DIR" --preset=default
 fi
 cmake --build "$BUILD_DIR" --target binary package -j$(nproc)
+
+# 构建 op_extension (.so)
+echo "--- building op_extension ---"
+EXT_DIR="$script_path/op_extension"
+EXT_BUILD="$EXT_DIR/build"
+mkdir -p "$EXT_BUILD"
+TORCH_CMAKE=$(python3 -c "import torch; print(torch.utils.cmake_prefix_path)" 2>/dev/null)
+if [ -z "$TORCH_CMAKE" ] || [ ! -d "$TORCH_CMAKE" ]; then
+    echo "ERROR: torch not found (python3 -c 'import torch' failed)."
+    echo "Please install torch (and torch_npu) in the python3 environment first."
+    exit 1
+fi
+cd "$EXT_BUILD"
+cmake "$EXT_DIR" -DCMAKE_PREFIX_PATH="$TORCH_CMAKE" -DASCEND_HOME_PATH="$ASCEND_HOME_PATH"
+cmake --build "$EXT_BUILD" -j$(nproc)
+echo "--- op_extension built: $EXT_BUILD/libbev_pool_ops.so ---"
