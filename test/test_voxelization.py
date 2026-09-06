@@ -133,3 +133,25 @@ def test_voxel_size_non_uniform():
     assert out.coords[0, 2].item() == 3  # x
     assert out.coords[0, 1].item() == 1  # y
     assert out.coords[0, 0].item() == 3  # z
+
+
+def test_small_max_voxels_works():
+    """max_voxels 过小不应报错（workspace 现在使用框架分配，独立于 voxels buffer）。"""
+    np.random.seed(42)
+    pts = np.random.uniform(0, 5, (500, 4)).astype(np.float32)
+    pts = torch.from_numpy(pts).npu()
+    for mv in [60, 40, 10, 1]:
+        out = voxelization(pts, voxel_size=(1, 1, 1), pcr=(0, 0, 0, 5, 5, 5),
+                          max_voxels=mv)
+        torch.npu.synchronize()
+        assert out.num_voxels <= mv, f"max_voxels={mv} got {out.num_voxels}"
+
+
+def test_large_grid_works():
+    """小 voxel_size 大网格应正常工作（workspace 使用框架分配，不再受 voxels buffer 限制）。"""
+    np.random.seed(42)
+    pts = np.random.uniform(0, 5, (500, 4)).astype(np.float32)
+    pts = torch.from_numpy(pts).npu()
+    out = voxelization(pts, voxel_size=(0.08, 0.08, 4.0), max_voxels=40000)
+    torch.npu.synchronize()
+    assert out.num_voxels > 0

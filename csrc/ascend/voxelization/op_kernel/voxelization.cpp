@@ -30,6 +30,7 @@ public:
 
     __aicore__ inline void Init(GM_ADDR points, GM_ADDR voxels, GM_ADDR coords,
                                 GM_ADDR numPointsOut, GM_ADDR numVoxelsOut,
+                                GM_ADDR workspaceArg,
                                 const VoxelizationTilingData* tiling)
     {
         t_ = tiling;
@@ -44,15 +45,9 @@ public:
         numPointsOut = (__gm__ uint8_t*)numPointsOut - 8;
         numVoxelsOut = (__gm__ uint8_t*)numVoxelsOut - 8;
 
-        // 在 voxels 输出 tensor 末尾划分 workspace 区域
-        uint32_t maxVox = tiling->maxVoxels;
-        uint32_t maxPts = tiling->maxNumPoints;
-        // wsFloats = offScratch/4 + 8*padN（scratch 每 vid 8 int32）
-        uint32_t wsFloats = (uint32_t)(tiling->offScratch / sizeof(int32_t))
-                          + 8u * tiling->padNumPoints;
-        // wsBase（float 为单位）= voxels 末尾减去 wsFloats
-        uint32_t voxTotalFloats = maxVox * maxPts * 4;
-        __gm__ int32_t* wsBase = (__gm__ int32_t*)voxels + (voxTotalFloats - wsFloats);
+        // 使用框架分配的 workspace（必须通过 GetUserWorkspace 解包，不能直接强转）
+        GM_ADDR userWS = AscendC::GetUserWorkspace(workspaceArg);
+        __gm__ int32_t* wsBase = (__gm__ int32_t*)userWS;
 
         // workspace 指针（全部指向 voxels 输出 tensor 内）
         localCntPtr_ = wsBase + (tiling->offLocalCnt / sizeof(int32_t))
@@ -598,6 +593,6 @@ extern "C" __global__ __aicore__ void voxelization(
 
     AscendC::TPipe pipe;
     KernelVoxelization op(&pipe);
-    op.Init(points, voxels, coords, num_points, num_voxels, &tilingData);
+    op.Init(points, voxels, coords, num_points, num_voxels, workspace, &tilingData);
     op.Process();
 }

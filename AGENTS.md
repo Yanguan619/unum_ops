@@ -52,6 +52,7 @@ python -m pytest test/test_spconv.py test/test_bev_pool.py test/test_voxelizatio
 - [x] **spconv benchmark**: `benchmark/bench_spconv.py` 回归基准
 - [x] **voxelization benchmark 补参数**: 不同 voxel_size/PCR 组合
 - [x] **test_bev_pool.py 去重**: 删除重复的 `test_all_oob_points`
+- [x] **voxelization 修复回归测试**: `test_small_max_voxels_clean_error` + `test_large_grid_clean_error` 断言干净报错而非崩溃
 
 ## Known Bugs (已修复)
 
@@ -72,7 +73,7 @@ python -m pytest test/test_spconv.py test/test_bev_pool.py test/test_voxelizatio
 全部完成。项目当前状态：
 
 - 3 个 AscendC 算子：bev_pool ✅ / voxelization ✅ / spconv ✅
-- 89 个测试全部通过，1500 次长稳压测 0 错误
+- 91 个测试全部通过，1500 次长稳压测 0 错误
 - 多 vendor 独立部署，统一 dlopen 加载，无冲突
 - pip install 时自动编译 AscendC 扩展 .so
 - 持续维护：`AGENTS.md` 记录所有已知问题和修复状态
