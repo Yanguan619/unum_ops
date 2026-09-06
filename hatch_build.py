@@ -257,8 +257,20 @@ class UnumOpsBuildHook(BuildHookInterface):
 
         ascend_home = os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/cann-9.0.0")
         print("[unum_ops] detected Ascend 310P, building C extensions ...")
+        import shutil
         for ext in _EXTENSIONS:
-            _build_ascend_extension(self.root, ext, ascend_home)
+            if not _build_ascend_extension(self.root, ext, ascend_home):
+                print(f"[unum_ops] {ext['name']} build failed, will use source tree fallback")
+                continue
+            # 复制 .so 到包目录 _libs/，使 wheel 打包时包含
+            name = ext["name"]
+            so_name = ext["so_name"]
+            src_so = os.path.join(self.root, ext["src_dir"], "build", so_name)
+            if os.path.isfile(src_so):
+                dst_dir = os.path.join(self.root, "src", "unum_ops", name, "_libs")
+                os.makedirs(dst_dir, exist_ok=True)
+                shutil.copy2(src_so, os.path.join(dst_dir, so_name))
+                print(f"[unum_ops] copied {so_name} to {dst_dir}")
 
     def finalize(self, version: str, build_data: dict, artifact_path: str | None) -> None:
         """构建完成后把 .so 拷入包目录，使 pip install 后 `_find_ops_lib` 能找到。"""
