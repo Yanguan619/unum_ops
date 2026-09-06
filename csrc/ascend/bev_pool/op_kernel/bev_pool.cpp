@@ -33,10 +33,16 @@ public:
 
         featsGm_.SetGlobalBuffer(featsPtr_, (int64_t)tiling->numPoints * tiling->numChannels);
         outGm_.SetGlobalBuffer(outPtr_, (int64_t)tiling->gridTotal * tiling->numChannels);
+        startsGm_.SetGlobalBuffer(startsPtr_, (int64_t)tiling->numIntervals);
+        lengthsGm_.SetGlobalBuffer(lengthsPtr_, (int64_t)tiling->numIntervals);
+        coordsGm_.SetGlobalBuffer(coordPtr_, (int64_t)tiling->numPoints * 4);
 
         const uint32_t C = t_->numChannels;
         pipe_->InitBuffer(bufAcc_, C * sizeof(float));
         pipe_->InitBuffer(bufAcc1_, C * sizeof(float));
+        pipe_->InitBuffer(bufStarts_, BEV_TILE_POINTS * sizeof(int32_t));
+        pipe_->InitBuffer(bufLengths_, BEV_TILE_POINTS * sizeof(int32_t));
+        pipe_->InitBuffer(bufCoords_, BEV_MAX_TILE_POINTS * 4 * sizeof(int32_t));
         pipe_->InitBuffer(bufChunk_, (int64_t)t_->tilePoints * ((int64_t)t_->numChannels) * sizeof(float));
     }
 
@@ -122,18 +128,27 @@ private:
         AscendC::LocalTensor<float> chunk = bufChunk_.Get<float>();
         AscendC::LocalTensor<float> acc = bufAcc_.Get<float>();
         AscendC::LocalTensor<float> acc1 = bufAcc1_.Get<float>();
+        AscendC::LocalTensor<int32_t> startsUb = bufStarts_.Get<int32_t>();
+        AscendC::LocalTensor<int32_t> lengthsUb = bufLengths_.Get<int32_t>();
 
         // ---- Load phase: 累积连续 interval 的点行直到块容量 ----
         // 所有 ln > 0 的 interval（包括 OOB）都计入 rowOff，
         // 因为它们的行在 GM 中连续排列。
+        // 批量 DataCopy 读 starts/lengths 到 UB，避免逐 interval GM 标量读（scalar 瓶颈）
         uint32_t iv = iv0;
+        uint32_t avail = BevMinU(BEV_TILE_POINTS, endInt_ - iv0);
+        AscendC::DataCopy(startsUb, startsGm_[iv0], (int32_t)avail);
+        AscendC::DataCopy(lengthsUb, lengthsGm_[iv0], (int32_t)avail);
+        AscendC::PipeBarrier<PIPE_MTE2>();
+        uint32_t availIdx = 0;
         int64_t rowOff = 0;
         int64_t firstStart = -1;
-        while (iv < endInt_) {
-            int32_t s = startsPtr_[iv];
-            int32_t ln = lengthsPtr_[iv];
+        while (iv < endInt_ && availIdx < avail) {
+            int32_t s = startsUb.GetValue(availIdx);
+            int32_t ln = lengthsUb.GetValue(availIdx);
             if (ln <= 0 || (uint32_t)(s + ln) > t_->numPoints) {
                 iv++;
+                availIdx++;
                 continue;
             }
             if (firstStart < 0) {
@@ -144,6 +159,7 @@ private:
             }
             rowOff += ln;
             iv++;
+            availIdx++;
         }
         if (rowOff == 0) {
             // 首 interval 就超容量（或全为空）→ 单独处理这个大 interval。
@@ -154,6 +170,11 @@ private:
         AscendC::DataCopy(chunk, featsGm_[(int64_t)firstStart * C], (int32_t)(rowOff * C));
         AscendC::PipeBarrier<PIPE_MTE2>();
 
+        // 批量读 coords 到 UB（compute phase 用 UB 替代 GM 标量读，消除 InBounds/OutputOffset 的标量瓶颈）
+        AscendC::LocalTensor<int32_t> coordsUb = bufCoords_.Get<int32_t>();
+        AscendC::DataCopy(coordsUb, coordsGm_[(int64_t)firstStart * 4], (int32_t)(rowOff * 4));
+        AscendC::PipeBarrier<PIPE_MTE2>();
+
         // ---- Compute phase: 逐 interval 在 UB 内累加并写出 ----
         // 双缓冲：两个 acc 交替。当前 interval 的 Duplicate+Add(V pipe) 与
         // 上一 interval 的 DataCopy(out)(MTE3 pipe) 重叠，隐藏 MTE3 写延迟。
@@ -161,13 +182,23 @@ private:
         uint32_t bufIdx = 0;
         bool pendingWrite = false;
         for (uint32_t j = iv0; j < iv; j++) {
-            int32_t s = startsPtr_[j];
-            int32_t ln = lengthsPtr_[j];
+            int32_t s = startsUb.GetValue(j - iv0);
+            int32_t ln = lengthsUb.GetValue(j - iv0);
             if (ln <= 0 || (uint32_t)(s + ln) > t_->numPoints) {
                 continue;
             }
-            if (InBounds((uint32_t)s)) {
-                uint64_t outOff = OutputOffset((uint32_t)s);
+            // UB coords：x,y,z,batch 分别在第 0/1/2/3 列，偏移 (s - firstStart)*4
+            int32_t bx = coordsUb.GetValue((int64_t)(s - firstStart) * 4 + 0);
+            int32_t by = coordsUb.GetValue((int64_t)(s - firstStart) * 4 + 1);
+            int32_t bz = coordsUb.GetValue((int64_t)(s - firstStart) * 4 + 2);
+            int32_t batch = coordsUb.GetValue((int64_t)(s - firstStart) * 4 + 3);
+            if (bx < 0 || bx >= (int32_t)t_->gridW) continue;
+            if (by < 0 || by >= (int32_t)t_->gridH) continue;
+            if (bz < 0 || bz >= (int32_t)t_->gridD) continue;
+            if (batch < 0 || batch >= (int32_t)t_->gridB) continue;
+            {
+                uint64_t outOff = ((uint64_t)batch * t_->gridD + (uint64_t)bz) * t_->gridH + (uint64_t)by;
+                outOff = (outOff * t_->gridW + (uint64_t)bx) * t_->numChannels;
                 AscendC::LocalTensor<float> cur = (bufIdx == 0) ? acc : acc1;
                 AscendC::Duplicate<float>(cur, 0.0f, (int32_t)C);
                 for (int32_t r = 0; r < ln; r++) {
@@ -238,8 +269,14 @@ private:
     __gm__ float* outPtr_;
     AscendC::GlobalTensor<float> featsGm_;
     AscendC::GlobalTensor<float> outGm_;
+    AscendC::GlobalTensor<int32_t> startsGm_;
+    AscendC::GlobalTensor<int32_t> lengthsGm_;
+    AscendC::GlobalTensor<int32_t> coordsGm_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> bufAcc_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> bufAcc1_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> bufStarts_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> bufLengths_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> bufCoords_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> bufChunk_;
 };
 
