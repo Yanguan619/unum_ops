@@ -105,12 +105,11 @@ static ge::graphStatus InferShape(gert::InferShapeContext* context)
     if (outShape == nullptr) {
         return ge::GRAPH_FAILED;
     }
-    outShape->SetDimNum(5);
-    outShape->SetDim(0, gridB);
-    outShape->SetDim(1, gridD);
-    outShape->SetDim(2, gridH);
-    outShape->SetDim(3, gridW);
-    outShape->SetDim(4, numChannels);
+    // 输出实际是 2D [gridTotal, C]（Python 层 view+permute 回 [B,D,H,W,C]），
+    // 与 aclnn/register 返回的 tensor 形状保持一致，避免形状验证不匹配。
+    outShape->SetDimNum(2);
+    outShape->SetDim(0, gridB * gridD * gridH * gridW);
+    outShape->SetDim(1, numChannels);
 
     return GRAPH_SUCCESS;
 }

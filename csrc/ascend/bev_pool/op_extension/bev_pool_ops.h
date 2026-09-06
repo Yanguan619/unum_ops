@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026 Yanguan02
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
 #ifndef BEV_POOL_OPS_H
 #define BEV_POOL_OPS_H
 
@@ -5,7 +10,7 @@
 
 namespace ascend_kernel {
 
-// bev_pool 输出：out (B, D, H, W, C) float32
+// bev_pool 输出：out (gridTotal, C) float32（Python 层 view+permute 回 [B,C,D,H,W]）
 // 输入：feats (N, C) float32（已排序）
 //       coords (N, 4) int32（已排序）
 //       interval_starts (K,) int32

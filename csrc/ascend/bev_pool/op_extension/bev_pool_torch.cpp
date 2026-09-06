@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026 Yanguan02
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
 #include <cstdint>
 #include <vector>
 #include <string>

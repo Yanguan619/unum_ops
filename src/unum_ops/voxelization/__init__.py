@@ -48,13 +48,18 @@ class VoxelizationOutput:
 
 
 def _find_ops_lib() -> str:
-    """定位 libvoxelization_ops.so：优先环境变量，其次源码树。"""
+    """定位 libvoxelization_ops.so：优先环境变量，其次包内 _libs/，最后源码树。"""
     env = os.environ.get("VOXELIZATION_OPS_LIB")
     if env:
         if not os.path.exists(env):
             raise FileNotFoundError(f"VOXELIZATION_OPS_LIB does not exist: {env}")
         return env
     here = os.path.dirname(os.path.abspath(__file__))
+    # pip install 后 .so 在包目录 _libs/ 下
+    pkg_lib = os.path.join(here, "_libs", "libvoxelization_ops.so")
+    if os.path.exists(pkg_lib):
+        return pkg_lib
+    # 开发模式：源码树
     for _ in range(6):
         cand = os.path.join(here, _SO_REL)
         if os.path.exists(cand):
