@@ -7,8 +7,8 @@
 bash csrc/ascend/bev_pool/rebuild_install.sh
 python -m pytest test/test_bev_pool.py -q
 
-# voxelization: build OPP + op_extension + test
-cd csrc/ascend/voxelization && rm -rf build_out && bash build.sh && \
+# voxelization: build OPP + install + op_extension + test
+cd csrc/ascend/voxelization && rm -rf build_out /data/kernel_meta && bash build.sh && \
   PKG_DIR="build_out/_CPack_Packages/Linux/External/custom_opp_openEuler_aarch64.run/packages/vendors/voxelization" && \
   cp -a "$PKG_DIR/." /usr/local/Ascend/cann-9.0.0/opp/vendors/voxelization/ && \
   cd op_extension && rm -rf build && mkdir build && cd build && \
@@ -16,6 +16,9 @@ cd csrc/ascend/voxelization && rm -rf build_out && bash build.sh && \
   cmake .. -DASCEND_HOME_PATH=/usr/local/Ascend/cann-9.0.0 -DCMAKE_PREFIX_PATH="$TORCH_CMAKE" && \
   make -j4 && cd /workspace/unum_ops && \
   python -m pytest test/test_voxelization.py -q
+
+# voxelization benchmark
+python -m pytest benchmark/bench_voxelization.py -v
 
 # spconv tests
 python -m pytest test/test_spconv.py -q
@@ -34,7 +37,17 @@ python -m pytest test/test_spconv.py test/test_bev_pool.py test/test_voxelizatio
 - [x] **rebuild_install.sh 硬编码路径**: 动态 ASCEND_HOME_PATH + 动态查找 PKG_DIR
 - [x] **测试缺少边缘覆盖**: 16 个测试 (OOB/C=0/dtype/非连续/rank int64/网格维度)
 - [x] **spconv 正确性 bug**: SubM padding/stride/dilation, 2D _triple, dense()/from_dense() device, VoxelGenerator, _gather edge
-- [x] **voxelization 算子**: 独立 vendor + dlopen 统一加载, 20 测试通过, ~2x numpy 性能
+- [x] **voxelization 算子**: 独立 vendor + dlopen 统一加载, 20 测试通过
+- [x] **voxelization 性能优化**: wrapper 免 D2D 拷贝, 固定开销 ~7ms→~2.5ms (-64%)
+
+## Voxelization 性能
+
+| num_points | ascendc_ms | numpy_ms | 加速比 |
+|-----------|-----------|---------|--------|
+| 5,000 | 2.44 | 3.74 | 1.5x |
+| 20,000 | 6.06 | 15.30 | 2.5x |
+| 50,000 | 12.81 | 39.40 | 3.1x |
+| 100,000 | 23.41 | 80.43 | 3.4x |
 
 ## Remaining TODOs (by priority)
 

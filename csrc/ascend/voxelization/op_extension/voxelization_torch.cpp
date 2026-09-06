@@ -135,23 +135,22 @@ VoxelizationOutputs voxelization(const at::Tensor& points, c10::ArrayRef<double>
     auto N = points.size(0);
     aclrtStream aclStream = c10_npu::getCurrentNPUStream().stream(true);
 
-    size_t voxBytes = max_voxels * max_num_points * 4 * sizeof(float);
-    size_t coordBytes = max_voxels * 3 * sizeof(int32_t);
-    size_t nptsBytes = max_voxels * sizeof(int32_t);
-    size_t nvoxBytes = 64;
-
-    void* voxDev = nullptr; void* coordDev = nullptr;
-    void* nptsDev = nullptr; void* nvoxDev = nullptr;
-    funcs.rtMalloc(&voxDev, voxBytes, kAclMemMallocHugeFirst);
-    funcs.rtMalloc(&coordDev, coordBytes, kAclMemMallocHugeFirst);
-    funcs.rtMalloc(&nptsDev, nptsBytes, kAclMemMallocHugeFirst);
-    funcs.rtMalloc(&nvoxDev, nvoxBytes, kAclMemMallocHugeFirst);
+    // 直接用 torch tensor 作为输出（Python 层按 num_voxels 截断，
+    // workspace 写在 voxels 尾部无影响），省去 aclrtMalloc + D2D 拷贝。
+    at::Tensor voxels = at::empty({max_voxels, max_num_points, 4},
+                                  points.options().dtype(at::kFloat));
+    at::Tensor coords = at::empty({max_voxels, 3},
+                                  points.options().dtype(at::kInt));
+    at::Tensor num_points = at::empty({max_voxels},
+                                      points.options().dtype(at::kInt));
+    at::Tensor num_voxels = at::empty({1}, points.options().dtype(at::kInt));
 
     aclTensor* ptsTensor = MakeTensor(/*ACL_FLOAT*/ 0, {N, 4}, points.data_ptr());
-    aclTensor* voxTensor = MakeTensor(/*ACL_FLOAT*/ 0, {max_voxels, max_num_points, 4}, voxDev);
-    aclTensor* coordTensor = MakeTensor(/*ACL_INT32*/ 3, {max_voxels, 3}, coordDev);
-    aclTensor* nptsTensor = MakeTensor(/*ACL_INT32*/ 3, {max_voxels}, nptsDev);
-    aclTensor* nvoxTensor = MakeTensor(/*ACL_INT32*/ 3, {1}, nvoxDev);
+    aclTensor* voxTensor = MakeTensor(/*ACL_FLOAT*/ 0, {max_voxels, max_num_points, 4},
+                                      voxels.data_ptr());
+    aclTensor* coordTensor = MakeTensor(/*ACL_INT32*/ 3, {max_voxels, 3}, coords.data_ptr());
+    aclTensor* nptsTensor = MakeTensor(/*ACL_INT32*/ 3, {max_voxels}, num_points.data_ptr());
+    aclTensor* nvoxTensor = MakeTensor(/*ACL_INT32*/ 3, {1}, num_voxels.data_ptr());
 
     float vs[3] = {(float)voxel_size[0], (float)voxel_size[1], (float)voxel_size[2]};
     float pcrArr[6] = {(float)pcr[0], (float)pcr[1], (float)pcr[2],
@@ -176,24 +175,10 @@ VoxelizationOutputs voxelization(const at::Tensor& points, c10::ArrayRef<double>
     TORCH_CHECK(st == 0, "aclnnVoxelization failed: ", st);
     funcs.rtSync(aclStream);
 
-    int32_t nvox[16];
-    funcs.rtMemcpy(nvox, nvoxBytes, nvoxDev, nvoxBytes, kAclMemcpyDeviceToHost);
-
-    at::Tensor voxels = at::empty({max_voxels, max_num_points, 4}, points.options().dtype(at::kFloat));
-    at::Tensor coords = at::empty({max_voxels, 3}, points.options().dtype(at::kInt));
-    at::Tensor num_points = at::empty({max_voxels}, points.options().dtype(at::kInt));
-    at::Tensor num_voxels = at::empty({1}, points.options().dtype(at::kInt));
-
-    funcs.rtMemcpy(voxels.mutable_data_ptr(), voxBytes, voxDev, voxBytes, kAclMemcpyDeviceToDevice);
-    funcs.rtMemcpy(coords.mutable_data_ptr(), coordBytes, coordDev, coordBytes, kAclMemcpyDeviceToDevice);
-    funcs.rtMemcpy(num_points.mutable_data_ptr(), nptsBytes, nptsDev, nptsBytes, kAclMemcpyDeviceToDevice);
-    funcs.rtMemcpy(num_voxels.mutable_data_ptr(), 4, nvoxDev, 4, kAclMemcpyDeviceToDevice);
-
     funcs.destroyTensor(ptsTensor);
     funcs.destroyTensor(voxTensor); funcs.destroyTensor(coordTensor);
     funcs.destroyTensor(nptsTensor); funcs.destroyTensor(nvoxTensor);
     funcs.destroyFloatArray(vsArr); funcs.destroyFloatArray(pcrArrAc);
-    funcs.rtFree(voxDev); funcs.rtFree(coordDev); funcs.rtFree(nptsDev); funcs.rtFree(nvoxDev);
     if (wsDev) funcs.rtFree(wsDev);
 
     return {voxels, coords, num_points, num_voxels};

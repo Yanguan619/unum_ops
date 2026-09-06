@@ -447,6 +447,10 @@ public:
             AscendC::DataCopy(posBlk, ptLocalPosGm_[off], alignedCnt);
             AscendC::PipeBarrier<PIPE_ALL>();
 
+            // 缓存上一 blkBase 的 vid/cnt，避免同一 8-bin 块内逐点 DataCopy
+            uint32_t lastBlk = UINT32_MAX;
+            // 310P 标量寄存器可存 8 个 int32；用 local stack 变量
+            // 实际用 UB 的 vidBlk/cntBlk 保留上次结果，不重新 DataCopy
             for (uint32_t i = 0; i < cnt; i++) {
                 int32_t b = bin.GetValue(i);
                 int32_t xv = xi.GetValue(i);
@@ -455,9 +459,14 @@ public:
                 if (!IsPointValid(off, i, n, xv, yv, zv)) continue;
                 if (b < (int32_t)startBin_ || b >= (int32_t)endBin_) continue;
                 uint32_t blkBase = (uint32_t)b & ~7u;
-                AscendC::DataCopy(vidBlk, vidGm_[blkBase], 8);
-                AscendC::PipeBarrier<PIPE_ALL>();
-                int32_t vid = vidBlk.GetValue((uint32_t)b - blkBase);
+                uint32_t idx = (uint32_t)b - blkBase;
+                if (blkBase != lastBlk) {
+                    AscendC::DataCopy(vidBlk, vidGm_[blkBase], 8);
+                    AscendC::DataCopy(cntBlk, localCntGm_[blkBase], 8);
+                    AscendC::PipeBarrier<PIPE_ALL>();
+                    lastBlk = blkBase;
+                }
+                int32_t vid = vidBlk.GetValue(idx);
                 if (vid < 0) continue;
                 int32_t pos = posBlk.GetValue(i);
                 if (pos < (int32_t)maxPts) {
@@ -471,13 +480,8 @@ public:
                     vp[2] = zvF;
                     vp[3] = iv;
                     if (pos == 0) {
-                        // 读 localCnt 得到 cntV，打包到 scratch 槽位（MTE3 写 32B 单槽）。
-                        // 不再直接标量写 coords/npts 输出：多核并发写同一 32B 缓存行会丢写。
-                        AscendC::DataCopy(cntBlk, localCntGm_[blkBase], 8);
-                        AscendC::PipeBarrier<PIPE_ALL>();
-                        int32_t cntV = cntBlk.GetValue((uint32_t)b - blkBase);
+                        int32_t cntV = cntBlk.GetValue(idx);
                         cntV = (cntV < (int32_t)maxPts) ? cntV : (int32_t)maxPts;
-                        // 槽位 [vid, zv, yv, xv, cntV, 0, 0, 0]，vid 唯一 → 无跨核写竞争
                         cntBlk.SetValue(0, vid);
                         cntBlk.SetValue(1, zv);
                         cntBlk.SetValue(2, yv);
@@ -488,6 +492,8 @@ public:
                         cntBlk.SetValue(7, 0);
                         AscendC::DataCopy(scrGm_[(int64_t)vid * 8], cntBlk, 8);
                         AscendC::PipeBarrier<PIPE_ALL>();
+                        // cntBlk 被 scratch 覆盖，下一不同 blkBase 时自动重读
+                        lastBlk = UINT32_MAX;
                     }
                 }
             }
