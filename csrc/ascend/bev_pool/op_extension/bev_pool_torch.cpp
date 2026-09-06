@@ -85,12 +85,64 @@ BevPoolOutputs bev_pool(const at::Tensor& feats, const at::Tensor& coords,
                     funcs.destroyTensor,
                 "aclnnBevPool symbols not found (install OPP package / CANN env)");
 
+    // 输入验证
+    TORCH_CHECK(feats.dim() == 2, "feats must be 2-D (N, C), got ", feats.dim(), "-D");
+    TORCH_CHECK(coords.dim() == 2 && coords.size(1) == 4,
+                "coords must be 2-D (N, 4), got ", coords.dim(), "-D, size(1)=",
+                coords.size(1));
+    TORCH_CHECK(interval_starts.dim() == 1,
+                "interval_starts must be 1-D, got ", interval_starts.dim(), "-D");
+    TORCH_CHECK(interval_lengths.dim() == 1,
+                "interval_lengths must be 1-D, got ", interval_lengths.dim(), "-D");
+    TORCH_CHECK(interval_starts.size(0) == interval_lengths.size(0),
+                "interval_starts and interval_lengths must have same length, got ",
+                interval_starts.size(0), " vs ", interval_lengths.size(0));
+    TORCH_CHECK(feats.size(0) == coords.size(0),
+                "feats and coords must have same N, got ", feats.size(0),
+                " vs ", coords.size(0));
+    TORCH_CHECK(feats.scalar_type() == at::kFloat,
+                "feats must be float32, got ", feats.scalar_type());
+    TORCH_CHECK(coords.scalar_type() == at::kInt,
+                "coords must be int32, got ", coords.scalar_type());
+    TORCH_CHECK(interval_starts.scalar_type() == at::kInt,
+                "interval_starts must be int32, got ", interval_starts.scalar_type());
+    TORCH_CHECK(interval_lengths.scalar_type() == at::kInt,
+                "interval_lengths must be int32, got ", interval_lengths.scalar_type());
+    TORCH_CHECK(feats.is_privateuseone(),
+                "feats must be on NPU device, got ", feats.device());
+    TORCH_CHECK(coords.is_privateuseone(),
+                "coords must be on NPU device, got ", coords.device());
+    TORCH_CHECK(interval_starts.is_privateuseone(),
+                "interval_starts must be on NPU device, got ", interval_starts.device());
+    TORCH_CHECK(interval_lengths.is_privateuseone(),
+                "interval_lengths must be on NPU device, got ", interval_lengths.device());
+    TORCH_CHECK(feats.is_contiguous(),
+                "feats must be contiguous, got strides=", feats.strides());
+    TORCH_CHECK(coords.is_contiguous(),
+                "coords must be contiguous, got strides=", coords.strides());
+    TORCH_CHECK(interval_starts.is_contiguous(),
+                "interval_starts must be contiguous");
+    TORCH_CHECK(interval_lengths.is_contiguous(),
+                "interval_lengths must be contiguous");
+    TORCH_CHECK(batch > 0 && depth > 0 && height > 0 && width > 0,
+                "batch/depth/height/width must be > 0, got ",
+                batch, "/", depth, "/", height, "/", width);
+    TORCH_CHECK(feats.size(0) > 0,
+                "feats must have at least 1 point, got N=", feats.size(0));
+    TORCH_CHECK(feats.size(1) > 0,
+                "feats must have at least 1 channel, got C=", feats.size(1));
+
     auto N = feats.size(0);
     auto C = feats.size(1);
 
     // 输出用 2D [gridTotal, C] 避免 W 非 8 对齐时 DataCopy 写出未对齐。
     // kernel 按平坦 offset 写入，Python 层再 view+permute 回 [B,D,H,W,C]。
     int64_t gridTotal = batch * depth * height * width;
+    TORCH_CHECK(gridTotal > 0,
+                "gridTotal (B*D*H*W) must be > 0, got B=", batch, " D=", depth,
+                " H=", height, " W=", width);
+    TORCH_CHECK(gridTotal <= (int64_t)UINT32_MAX,
+                "gridTotal (B*D*H*W) must fit in uint32, got ", gridTotal);
     at::Tensor out = at::zeros({gridTotal, C},
                                feats.options().dtype(at::kFloat));
 

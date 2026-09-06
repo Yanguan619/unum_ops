@@ -4,19 +4,26 @@
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-TARGET_OPP=/usr/local/Ascend/cann-9.0.0/opp/vendors/customize
+ASCEND_HOME="${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.0.0}"
+TARGET_OPP="${ASCEND_HOME}/opp/vendors/customize"
 
 echo "=== Clearing TBE compilation caches ==="
-rm -rf /data/kernel_meta /workspace/unum_ops/kernel_meta
+rm -rf "$SCRIPT_DIR/kernel_meta" 2>/dev/null || true
+rm -rf /data/kernel_meta 2>/dev/null || true
 rm -rf "$SCRIPT_DIR/build_out"
+rm -rf "$SCRIPT_DIR/op_extension/build"
 
 echo "=== Building OPP package + op_extension ==="
+cd "$SCRIPT_DIR"
 bash "$SCRIPT_DIR/build.sh"
 
-PKG_DIR="$SCRIPT_DIR/build_out/_CPack_Packages/Linux/External/custom_opp_openEuler_aarch64.run/packages/vendors/customize"
-if [ -d "$PKG_DIR" ]; then
+# Find the generated package dynamically (platform/arch agnostic)
+PKG_DIR=$(find "$SCRIPT_DIR/build_out/_CPack_Packages" -type d -name "customize" -path "*/vendors/customize" 2>/dev/null | head -1)
+if [ -z "$PKG_DIR" ]; then
+    echo "WARNING: OPP package directory not found, skipping install"
+else
     echo "=== Installing OPP into $TARGET_OPP ==="
-    # Clean previous customize deployment of bev_pool ops (keep op_api header dir intact by overwrite)
+    mkdir -p "$TARGET_OPP"
     cp -a "$PKG_DIR/." "$TARGET_OPP/"
     echo "=== OPP installed ==="
 fi

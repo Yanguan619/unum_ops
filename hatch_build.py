@@ -68,12 +68,14 @@ _EXTENSIONS = [
         "src_dir": "csrc/ascend/bev_pool/op_extension",
         "so_name": "libbev_pool_ops.so",
         "require_headers": ["aclnn_bev_pool.h"],
+        "opp_source_dir": "csrc/ascend/bev_pool",
     },
     {
         "name": "voxelization",
         "src_dir": "csrc/ascend/voxelization/op_extension",
         "so_name": "libvoxelization_ops.so",
         "require_headers": ["aclnn_voxelization.h"],
+        "opp_source_dir": "csrc/ascend/voxelization",
     },
 ]
 
@@ -97,6 +99,72 @@ def _get_torch_cmake_prefix(system_py: str) -> str | None:
     return None
 
 
+def _build_opp_and_install(root: str, ext: dict, ascend_home: str, system_py: str) -> bool:
+    """构建并安装 OPP 内核包（生成 ACLNN 头文件），成功返回 True。"""
+    name = ext["name"]
+    opp_dir = os.path.join(root, ext["opp_source_dir"])
+    build_sh = os.path.join(opp_dir, "build.sh")
+    build_out = os.path.join(opp_dir, "build_out")
+
+    if not os.path.isfile(build_sh):
+        print(f"[unum_ops] {name}: build.sh not found at {build_sh}, cannot build OPP")
+        return False
+
+    env = os.environ.copy()
+    env["PATH"] = os.path.dirname(system_py) + ":" + env.get("PATH", "")
+    env["ASCEND_HOME_PATH"] = ascend_home
+
+    print(f"[unum_ops] {name}: building OPP kernel package ...")
+    try:
+        result = subprocess.run(
+            ["bash", build_sh],
+            cwd=opp_dir, check=True, capture_output=True, text=True,
+            env=env, timeout=600,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"[unum_ops] {name} OPP build failed (stderr):")
+        for line in (e.stderr or "").splitlines()[-15:]:
+            print(f"  | {line}")
+        return False
+    except subprocess.TimeoutExpired:
+        print(f"[unum_ops] {name} OPP build timed out (>600s)")
+        return False
+
+    # 安装 OPP 到 CANN vendors（使头文件在 op_api/include 下可见）
+    pkg_dir = os.path.join(
+        build_out, "_CPack_Packages", "Linux", "External",
+        "custom_opp_openEuler_aarch64.run", "packages", "vendors", "customize",
+    )
+    if not os.path.isdir(pkg_dir):
+        # 尝试 .run 文件直接安装
+        run_file = os.path.join(build_out, "custom_opp_openEuler_aarch64.run")
+        if os.path.isfile(run_file):
+            import stat
+            os.chmod(run_file, os.stat(run_file).st_mode | stat.S_IEXEC)
+            try:
+                subprocess.run(
+                    ["bash", run_file],
+                    cwd=build_out, check=True, capture_output=True, text=True,
+                    env=env, timeout=120,
+                )
+                pkg_dir = os.path.join(build_out, "_CPack_Packages", "Linux", "External",
+                                       "custom_opp_openEuler_aarch64.run", "packages", "vendors", "customize")
+            except Exception:
+                pass
+
+    target_opp = os.path.join(ascend_home, "opp", "vendors", "customize")
+    if os.path.isdir(pkg_dir):
+        import shutil
+        print(f"[unum_ops] {name}: installing OPP into {target_opp} ...")
+        shutil.copytree(pkg_dir, target_opp, dirs_exist_ok=True)
+        print(f"[unum_ops] {name}: OPP installed successfully")
+        return True
+    else:
+        print(f"[unum_ops] {name}: OPP package built but install directory not found at {pkg_dir}")
+        print(f"[unum_ops] {name}: manually install: bash {build_sh}  and  bash {os.path.join(opp_dir, 'rebuild_install.sh')}")
+        return False
+
+
 def _build_ascend_extension(root: str, ext: dict, ascend_home: str) -> bool:
     """编译单个 AscendC 扩展 .so，成功返回 True。"""
     name = ext["name"]
@@ -109,13 +177,21 @@ def _build_ascend_extension(root: str, ext: dict, ascend_home: str) -> bool:
         print(f"[unum_ops] {so_name} already exists, skipping build")
         return True
 
-    # 前置检查：ACLNN 头文件（来自已安装的 OPP 内核包）
+    # 检查 / 构建 OPP 内核包（提供 ACLNN 头文件）
     op_api_inc = os.path.join(ascend_home, "opp", "vendors", "customize", "op_api", "include")
-    for hdr in ext.get("require_headers", []):
-        if not os.path.isfile(os.path.join(op_api_inc, hdr)):
-            print(f"[unum_ops] {name} build skipped: missing OPP header {hdr}")
-            print(f"[unum_ops]   expected at: {op_api_inc}")
-            print(f"[unum_ops]   run first: bash {ext['src_dir'].replace('/op_extension','')}/build.sh  (or rebuild_install.sh)")
+    headers_missing = [h for h in ext.get("require_headers", [])
+                       if not os.path.isfile(os.path.join(op_api_inc, h))]
+    if headers_missing:
+        print(f"[unum_ops] {name}: missing OPP headers {headers_missing}, building OPP kernel ...")
+        system_py = _system_python()
+        if not _build_opp_and_install(root, ext, ascend_home, system_py):
+            print(f"[unum_ops] {name}: OPP build+install failed, cannot build {so_name}")
+            return False
+        # 再次检查头文件
+        still_missing = [h for h in headers_missing
+                         if not os.path.isfile(os.path.join(op_api_inc, h))]
+        if still_missing:
+            print(f"[unum_ops] {name}: OPP headers still missing after install: {still_missing}")
             return False
 
     system_py = _system_python()
@@ -131,11 +207,10 @@ def _build_ascend_extension(root: str, ext: dict, ascend_home: str) -> bool:
 
     os.makedirs(build_dir, exist_ok=True)
     try:
-        # 用系统 python 执行 cmake（确保 torch 可用）
         env = os.environ.copy()
         env["PATH"] = os.path.dirname(system_py) + ":" + env.get("PATH", "")
 
-        print(f"[unum_ops] building {name} ...")
+        print(f"[unum_ops] building {name} op_extension ...")
         subprocess.run(
             ["cmake", src_dir,
              "-DCMAKE_PREFIX_PATH=" + cmake_prefix,
@@ -152,7 +227,7 @@ def _build_ascend_extension(root: str, ext: dict, ascend_home: str) -> bool:
         print(f"[unum_ops] {so_name} not found after build, check build logs")
         return False
     except subprocess.CalledProcessError as e:
-        print(f"[unum_ops] {name} build failed (stderr below):")
+        print(f"[unum_ops] {name} op_extension build failed (stderr below):")
         if e.stderr:
             for line in e.stderr.strip().splitlines()[-15:]:
                 print(f"  | {line}")

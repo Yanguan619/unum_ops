@@ -90,6 +90,9 @@ private:
         if (!InBounds((uint32_t)start)) {
             return;
         }
+        if ((uint32_t)(start + length) > t_->numPoints) {
+            return;
+        }
         uint64_t outOff = OutputOffset((uint32_t)start);
         uint32_t C = t_->numChannels;
         __gm__ float* dst = outPtr_ + outOff;
@@ -127,7 +130,7 @@ private:
         while (iv < endInt_) {
             int32_t s = startsPtr_[iv];
             int32_t ln = lengthsPtr_[iv];
-            if (ln <= 0) {
+            if (ln <= 0 || (uint32_t)(s + ln) > t_->numPoints) {
                 iv++;
                 continue;
             }
@@ -156,7 +159,7 @@ private:
         for (uint32_t j = iv0; j < iv; j++) {
             int32_t s = startsPtr_[j];
             int32_t ln = lengthsPtr_[j];
-            if (ln <= 0) {
+            if (ln <= 0 || (uint32_t)(s + ln) > t_->numPoints) {
                 continue;
             }
             if (InBounds((uint32_t)s)) {
@@ -184,6 +187,9 @@ private:
         int32_t start = startsPtr_[iv];
         int32_t length = lengthsPtr_[iv];
         if (length <= 0 || !InBounds((uint32_t)start)) {
+            return iv + 1;
+        }
+        if ((uint32_t)(start + length) > t_->numPoints) {
             return iv + 1;
         }
         uint64_t outOff = OutputOffset((uint32_t)start);

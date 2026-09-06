@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 # ----------------------------------------------------------------------------------------------------------
 # Copyright (c) 2025 Huawei Technologies Co., Ltd.
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
@@ -32,8 +33,9 @@ mkdir -p build_out
 rm -rf build_out/*
 opts=$(python3 $ASCEND_HOME_PATH/tools/tikcpp/ascendc_kernel_cmake/fwk_modules/util/preset_parse.py $script_path/CMakePresets.json)
 cmake_version=$(cmake --version | grep "cmake version" | awk '{print $3}')
+min_version="3.19.0"
 
-if [ "$cmake_version" \< "3.19.0" ] ; then
+if [ "$(printf '%s\n' "$min_version" "$cmake_version" | sort -V | head -n1)" != "$min_version" ] ; then
     cmake -S . -B "$BUILD_DIR" $opts
 else
     cmake -S . -B "$BUILD_DIR" --preset=default

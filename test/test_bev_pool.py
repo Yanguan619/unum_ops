@@ -186,3 +186,141 @@ def test_output_device():
     coords[:, 3] = torch.randint(0, B, (N,), dtype=torch.int64)
     out = _run(feats, coords, B, D, H, W)
     assert out.device.type == "npu"
+
+
+# ── Edge cases ──────────────────────────────────────────────────────────────
+
+def _make_points(N, B, D, H, W, C, seed=42):
+    """生成随机点，与 _make_random_points 一致。"""
+    return _make_random_points(N, B, D, H, W, C, seed=seed)
+
+
+def test_all_oob_points():
+    """所有点都越界 → 输出全零。"""
+    B, D, H, W, C = 1, 2, 4, 4, 8
+    N = 20
+    feats, coords = _make_points(N, B, D, H, W, C, seed=6)
+    coords_oob = coords.clone()
+    coords_oob[:, 0] = -2  # 全部 x 越界
+    out = _run(feats, coords_oob, B, D, H, W)
+    assert torch.all(out.cpu() == 0.0), "all OOB points should produce zero output"
+
+
+def test_all_oob_points():
+    """所有点都越界 → 输出全零。"""
+    B, D, H, W, C = 1, 2, 4, 4, 8
+    N = 20
+    feats, coords = _make_points(N, B, D, H, W, C, seed=6)
+    coords_oob = coords.clone()
+    coords_oob[:, 0] = -2  # 全部 x 越界
+    out = _run(feats, coords_oob, B, D, H, W)
+    assert torch.all(out.cpu() == 0.0)
+
+
+def test_rank_int64_no_float_collision():
+    """rank 用 int64 排序，大网格下不因 float32 精度碰撞而错。"""
+    # 构造 W < H 且 rank 值很大的情况（旧公式 float 会碰撞）
+    B, D, H, W, C = 2, 3, 10, 4, 8
+    N = 500
+    feats, coords = _make_points(N, B, D, H, W, C, seed=11)
+    # 随机打乱输入顺序（Python 层负责排序）
+    perm = torch.randperm(N)
+    feats_shuf, coords_shuf = feats[perm], coords[perm]
+    ref = bev_pool_ref(feats, coords, B, D, H, W)
+    out = _run(feats_shuf, coords_shuf, B, D, H, W)
+    assert torch.allclose(out.cpu(), ref, atol=1e-5), \
+        f"int64 rank mismatch: max diff={torch.abs(out.cpu() - ref).max().item()}"
+
+
+def test_non_contiguous_input():
+    """非连续输入应被拒绝（binding TORCH_CHECK 抛错）。"""
+    B, D, H, W, C = 1, 2, 4, 4, 8
+    N = 50
+    feats, coords = _make_points(N, B, D, H, W, C, seed=7)
+    pts = feats.npu().contiguous()
+    cs = coords.npu().contiguous()
+    # 构造 rank 排序所需的输入（与 wrapper 一致），再制造非连续 feats
+    ranks = (cs[:, 0] + cs[:, 1] * W + cs[:, 2] * (W * H) + cs[:, 3] * (W * H * D))
+    indices = ranks.argsort()
+    feats_sorted = pts[indices].contiguous()
+    coords_sorted = cs[indices].int().contiguous()
+    ranks_sorted = ranks[indices]
+    kept = torch.ones(N, device=feats_sorted.device, dtype=torch.bool)
+    kept[1:] = ranks_sorted[1:] != ranks_sorted[:-1]
+    interval_starts = torch.where(kept)[0].int().contiguous()
+    interval_lengths = torch.zeros_like(interval_starts)
+    interval_lengths[:-1] = interval_starts[1:] - interval_starts[:-1]
+    interval_lengths[-1] = N - interval_starts[-1]
+
+    # 制造非连续 feats：cat 后取偏移切片（stride 非 1）
+    feats_big = torch.cat([feats_sorted, feats_sorted], dim=1)  # (N, 2C)
+    feats_nc = feats_big[:, 1:C + 1]                            # (N, C) 非连续
+    assert not feats_nc.is_contiguous()
+    with pytest.raises(RuntimeError):
+        torch.ops.unum.bev_pool(feats_nc, coords_sorted, interval_starts,
+                                interval_lengths, int(B), int(D), int(H), int(W))
+
+
+def test_wrong_dtype_input():
+    """错误 dtype 输入应被拒绝（直接调底层算子）。"""
+    B, D, H, W, C = 1, 2, 4, 4, 8
+    N = 50
+    feats, coords = _make_points(N, B, D, H, W, C, seed=8)
+    pts = feats.npu().contiguous()
+    cs = coords.npu().contiguous()
+    ranks = (cs[:, 0] + cs[:, 1] * W + cs[:, 2] * (W * H) + cs[:, 3] * (W * H * D))
+    indices = ranks.argsort()
+    feats_sorted = pts[indices].contiguous()
+    coords_sorted = cs[indices].int().contiguous()
+    ranks_sorted = ranks[indices]
+    kept = torch.ones(N, device=feats_sorted.device, dtype=torch.bool)
+    kept[1:] = ranks_sorted[1:] != ranks_sorted[:-1]
+    interval_starts = torch.where(kept)[0].int().contiguous()
+    interval_lengths = torch.zeros_like(interval_starts)
+    interval_lengths[:-1] = interval_starts[1:] - interval_starts[:-1]
+    interval_lengths[-1] = N - interval_starts[-1]
+
+    # feats 用 float16 → 拒绝（NPU 上 double 会被替换为 float，故用 half）
+    with pytest.raises(RuntimeError):
+        torch.ops.unum.bev_pool(feats_sorted.half(), coords_sorted,
+                                interval_starts, interval_lengths,
+                                int(B), int(D), int(H), int(W))
+    # coords 用 float32 → 拒绝
+    with pytest.raises(RuntimeError):
+        torch.ops.unum.bev_pool(feats_sorted, coords_sorted.float(),
+                                interval_starts, interval_lengths,
+                                int(B), int(D), int(H), int(W))
+    # interval_starts 用 float32 → 拒绝
+    with pytest.raises(RuntimeError):
+        torch.ops.unum.bev_pool(feats_sorted, coords_sorted,
+                                interval_starts.float(), interval_lengths,
+                                int(B), int(D), int(H), int(W))
+
+
+def test_invalid_grid_dims():
+    """非正网格维度应被拒绝。"""
+    B, D, H, W, C = 1, 2, 4, 4, 8
+    N = 50
+    feats, coords = _make_points(N, B, D, H, W, C, seed=9)
+    pts = feats.npu().contiguous()
+    cs = coords.npu().contiguous()
+    with pytest.raises(RuntimeError):
+        bev_pool(pts, cs, 0, D, H, W)   # B=0
+    with pytest.raises(RuntimeError):
+        bev_pool(pts, cs, B, 0, H, W)   # D=0
+    with pytest.raises(RuntimeError):
+        bev_pool(pts, cs, B, D, 0, W)   # H=0
+    with pytest.raises(RuntimeError):
+        bev_pool(pts, cs, B, D, H, 0)   # W=0
+
+
+def test_coords_wrong_columns():
+    """coords 列数不为 4 应被拒绝（wrapper 在 rank 计算前检查）。"""
+    B, D, H, W, C = 1, 2, 4, 4, 8
+    N = 50
+    feats, coords = _make_points(N, B, D, H, W, C, seed=10)
+    pts = feats.npu().contiguous()
+    cs = coords.npu().contiguous()
+    bad_coords = cs[:, :3]  # 只有 3 列
+    with pytest.raises((RuntimeError, IndexError)):
+        bev_pool(pts, bad_coords, B, D, H, W)

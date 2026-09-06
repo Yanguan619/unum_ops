@@ -101,10 +101,10 @@ def bev_pool(feats, coords, B, D, H, W):
     ranks = (
         coords[:, 0] + coords[:, 1] * W + coords[:, 2] * (W * H) +
         coords[:, 3] * (W * H * D))
-    indices = ranks.float().argsort()
+    indices = ranks.argsort()
     feats = feats[indices].contiguous()
     coords = coords[indices].int().contiguous()
-    ranks_sorted = ranks[indices].float().contiguous()
+    ranks_sorted = ranks[indices]
 
     kept = torch.ones(N, device=device, dtype=torch.bool)
     kept[1:] = ranks_sorted[1:] != ranks_sorted[:-1]

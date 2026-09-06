@@ -35,7 +35,11 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     uint32_t gridD = (dAttr != nullptr) ? (uint32_t)*dAttr : 1;
     uint32_t gridH = (hAttr != nullptr) ? (uint32_t)*hAttr : 1;
     uint32_t gridW = (wAttr != nullptr) ? (uint32_t)*wAttr : 1;
-    uint32_t gridTotal = gridB * gridD * gridH * gridW;
+    uint64_t gridTotal64 = (uint64_t)gridB * (uint64_t)gridD * (uint64_t)gridH * (uint64_t)gridW;
+    if (gridTotal64 > UINT32_MAX || gridTotal64 == 0) {
+        return ge::GRAPH_FAILED;
+    }
+    uint32_t gridTotal = (uint32_t)gridTotal64;
 
     auto platform = platform_ascendc::PlatformAscendCManager::GetInstance();
     uint32_t coreNum = (platform != nullptr) ? platform->GetCoreNumAiv() : BEV_MAX_CORES;
