@@ -22,7 +22,6 @@ include_directories(
     ${TORCH_INCLUDE_DIRS}
     ${TORCH_NPU_DIR}/include
     ${ASCEND_HOME_PATH}/aarch64-linux/include
-    ${ASCEND_HOME_PATH}/opp/vendors/customize/op_api/include
     /usr/local/python3.11.15/include/python3.11
 )
 
@@ -33,11 +32,12 @@ set(SOURCES
 
 add_library(voxelization_ops SHARED ${SOURCES})
 
+target_compile_definitions(voxelization_ops PRIVATE
+    UNUM_VENDOR_DIR="voxelization"
+)
+
 target_link_libraries(voxelization_ops PRIVATE
     "${TORCH_LIBRARIES}"
-    "${ASCEND_HOME_PATH}/opp/vendors/customize/op_api/lib/libcust_opapi.so"
-    "${ASCEND_HOME_PATH}/aarch64-linux/lib64/libnnopbase.so"
-    "${ASCEND_HOME_PATH}/aarch64-linux/lib64/libascendcl.so"
     "${TORCH_NPU_DIR}/lib/libtorch_npu.so"
 )
 

@@ -35,7 +35,7 @@
                 },
                 "vendor_name": {
                     "type": "STRING",
-                    "value": "customize"
+                    "value": "voxelization"
                 },
                 "ASCEND_CANN_PACKAGE_PATH": {
                     "type": "PATH",

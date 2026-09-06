@@ -75,11 +75,17 @@ execute_process(
 string(REGEX REPLACE "\n.*" "" TORCH_NPU_TMP "${TORCH_NPU_RAW}")
 string(STRIP "${TORCH_NPU_TMP}" TORCH_NPU_DIR)
 
+# bev_pool 使用独立 vendor 名（非 customize），op_api 库在 vendors/bev_pool/ 下
+set(BEV_POOL_OP_API_DIR "${ASCEND_HOME_PATH}/opp/vendors/bev_pool/op_api")
+if(NOT EXISTS "${BEV_POOL_OP_API_DIR}/lib/libcust_opapi.so")
+    set(BEV_POOL_OP_API_DIR "${ASCEND_HOME_PATH}/opp/vendors/customize/op_api")
+endif()
+
 include_directories(
     ${TORCH_INCLUDE_DIRS}
     ${TORCH_NPU_DIR}/include
     ${ASCEND_HOME_PATH}/aarch64-linux/include
-    ${ASCEND_HOME_PATH}/opp/vendors/customize/op_api/include
+    ${BEV_POOL_OP_API_DIR}/include
     ${PY_INCLUDE_DIR}
 )
 
@@ -89,6 +95,10 @@ set(SOURCES
 )
 
 add_library(bev_pool_ops SHARED ${SOURCES})
+
+target_compile_definitions(bev_pool_ops PRIVATE
+    UNUM_VENDOR_DIR="bev_pool"
+)
 
 target_link_libraries(bev_pool_ops PRIVATE
     "${TORCH_LIBRARIES}"

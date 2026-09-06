@@ -1,18 +1,104 @@
 #include <cstdint>
+#include <cstdlib>
+#include <string>
 #include <vector>
-#include "acl/acl.h"
-#include "acl/acl_rt.h"
-#include "aclnn_voxelization.h"
+#include <dlfcn.h>
 #include <torch/extension.h>
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "voxelization_ops.h"
 
-namespace ascend_kernel {
+#ifndef UNUM_VENDOR_DIR
+#define UNUM_VENDOR_DIR "voxelization"
+#endif
 
 namespace {
 
-aclTensor* MakeTensorFromPtr(aclDataType dataType, const std::vector<int64_t>& shape,
-                             void* ptr) {
+struct aclTensor;
+struct aclOpExecutor;
+struct aclFloatArray;
+typedef void* aclrtStream;
+typedef int aclError;
+
+constexpr int kAclMemMallocHugeFirst = 0;
+constexpr int kAclMemcpyDeviceToHost = 1;
+constexpr int kAclMemcpyDeviceToDevice = 3;
+
+typedef aclError (*GetWorkspaceSizeFunc)(const aclTensor*, const aclFloatArray*,
+                                         const aclFloatArray*, int64_t, int64_t,
+                                         const aclTensor*, const aclTensor*,
+                                         const aclTensor*, const aclTensor*,
+                                         uint64_t*, aclOpExecutor**);
+typedef aclError (*RunFunc)(void*, uint64_t, aclOpExecutor*, aclrtStream);
+typedef aclTensor* (*CreateTensorFunc)(const int64_t*, uint64_t, int,
+                                       const int64_t*, int64_t, int,
+                                       const int64_t*, uint64_t, void*);
+typedef aclError (*DestroyTensorFunc)(const aclTensor*);
+typedef aclFloatArray* (*CreateFloatArrayFunc)(const float*, uint64_t);
+typedef aclError (*DestroyFloatArrayFunc)(const aclFloatArray*);
+typedef aclError (*RtMallocFunc)(void**, uint64_t, uint32_t);
+typedef aclError (*RtFreeFunc)(void*);
+typedef aclError (*RtMemcpyFunc)(void*, size_t, const void*, size_t, int);
+typedef aclError (*RtSyncFunc)(aclrtStream);
+
+struct AclnnFuncs {
+    GetWorkspaceSizeFunc getWorkspaceSize = nullptr;
+    RunFunc run = nullptr;
+    CreateTensorFunc createTensor = nullptr;
+    DestroyTensorFunc destroyTensor = nullptr;
+    CreateFloatArrayFunc createFloatArray = nullptr;
+    DestroyFloatArrayFunc destroyFloatArray = nullptr;
+    RtMallocFunc rtMalloc = nullptr;
+    RtFreeFunc rtFree = nullptr;
+    RtMemcpyFunc rtMemcpy = nullptr;
+    RtSyncFunc rtSync = nullptr;
+    bool loaded = false;
+};
+
+template <typename T>
+T Dlsym(void* handle, const char* name) {
+    return reinterpret_cast<T>(dlsym(handle, name));
+}
+
+std::string VendorLibPath() {
+    const char* opp = std::getenv("ASCEND_OPP_PATH");
+    if (!opp) opp = "/usr/local/Ascend/cann-9.0.0/opp";
+    return std::string(opp) + "/vendors/" UNUM_VENDOR_DIR "/op_api/lib/libcust_opapi.so";
+}
+
+AclnnFuncs& GetAclnnFuncs() {
+    static AclnnFuncs funcs;
+    if (!funcs.loaded) {
+        // 先 RTLD_GLOBAL 加载依赖库，使 libcust_opapi.so 内部符号可解析
+        dlopen("libnnopbase.so", RTLD_LAZY | RTLD_GLOBAL);
+        dlopen("libascendcl.so", RTLD_LAZY | RTLD_GLOBAL);
+
+        std::string path = VendorLibPath();
+        void* cust = dlopen(path.c_str(), RTLD_LAZY | RTLD_LOCAL);
+        if (cust) {
+            funcs.getWorkspaceSize = Dlsym<GetWorkspaceSizeFunc>(cust, "aclnnVoxelizationGetWorkspaceSize");
+            funcs.run = Dlsym<RunFunc>(cust, "aclnnVoxelization");
+        }
+        void* nnop = dlopen("libnnopbase.so", RTLD_LAZY | RTLD_GLOBAL);
+        if (nnop) {
+            funcs.createTensor = Dlsym<CreateTensorFunc>(nnop, "aclCreateTensor");
+            funcs.destroyTensor = Dlsym<DestroyTensorFunc>(nnop, "aclDestroyTensor");
+            funcs.createFloatArray = Dlsym<CreateFloatArrayFunc>(nnop, "aclCreateFloatArray");
+            funcs.destroyFloatArray = Dlsym<DestroyFloatArrayFunc>(nnop, "aclDestroyFloatArray");
+        }
+        void* rt = dlopen("libascendcl.so", RTLD_LAZY | RTLD_GLOBAL);
+        if (rt) {
+            funcs.rtMalloc = Dlsym<RtMallocFunc>(rt, "aclrtMalloc");
+            funcs.rtFree = Dlsym<RtFreeFunc>(rt, "aclrtFree");
+            funcs.rtMemcpy = Dlsym<RtMemcpyFunc>(rt, "aclrtMemcpy");
+            funcs.rtSync = Dlsym<RtSyncFunc>(rt, "aclrtSynchronizeStream");
+        }
+        funcs.loaded = true;
+    }
+    return funcs;
+}
+
+aclTensor* MakeTensor(int dataType, const std::vector<int64_t>& shape, void* ptr) {
+    auto& funcs = GetAclnnFuncs();
     int64_t ndim = shape.size();
     std::vector<int64_t> strides(ndim);
     int64_t s = 1;
@@ -20,15 +106,26 @@ aclTensor* MakeTensorFromPtr(aclDataType dataType, const std::vector<int64_t>& s
         strides[i] = s;
         s *= shape[i];
     }
-    return aclCreateTensor(shape.data(), ndim, dataType, strides.data(), ACL_FORMAT_ND,
-                           ACL_FORMAT_ND, shape.data(), ndim, ptr);
+    // 与原始实现一致：offset 位置传 ACL_FORMAT_ND，format 位置传 ACL_FORMAT_ND
+    return funcs.createTensor(shape.data(), ndim, dataType, strides.data(),
+                              /*ACL_FORMAT_ND*/ 2, /*ACL_FORMAT_ND*/ 2,
+                              shape.data(), ndim, ptr);
 }
 
 }  // namespace
 
+namespace ascend_kernel {
+
 VoxelizationOutputs voxelization(const at::Tensor& points, c10::ArrayRef<double> voxel_size,
                                  c10::ArrayRef<double> pcr, int64_t max_num_points,
                                  int64_t max_voxels) {
+    auto& funcs = GetAclnnFuncs();
+    TORCH_CHECK(funcs.getWorkspaceSize && funcs.run && funcs.createTensor &&
+                    funcs.destroyTensor && funcs.createFloatArray &&
+                    funcs.destroyFloatArray && funcs.rtMalloc && funcs.rtFree &&
+                    funcs.rtMemcpy && funcs.rtSync,
+                "aclnnVoxelization symbols not found (install OPP package / CANN env)");
+
     TORCH_CHECK(points.is_privateuseone(), "points must be on NPU");
     TORCH_CHECK(points.scalar_type() == at::kFloat, "points must be float32");
     TORCH_CHECK(points.dim() == 2 && points.size(1) == 4, "points must be (N, 4)");
@@ -36,11 +133,8 @@ VoxelizationOutputs voxelization(const at::Tensor& points, c10::ArrayRef<double>
     TORCH_CHECK(pcr.size() == 6, "pcr must have 6 elements");
 
     auto N = points.size(0);
-
-    // torch_npu 当前 stream（stream(true) 返回前清 queue，确保与之前 NPU 操作有序）
     aclrtStream aclStream = c10_npu::getCurrentNPUStream().stream(true);
 
-    // 用 aclrtMalloc 分配输出
     size_t voxBytes = max_voxels * max_num_points * 4 * sizeof(float);
     size_t coordBytes = max_voxels * 3 * sizeof(int32_t);
     size_t nptsBytes = max_voxels * sizeof(int32_t);
@@ -48,64 +142,59 @@ VoxelizationOutputs voxelization(const at::Tensor& points, c10::ArrayRef<double>
 
     void* voxDev = nullptr; void* coordDev = nullptr;
     void* nptsDev = nullptr; void* nvoxDev = nullptr;
-    aclrtMalloc(&voxDev, voxBytes, ACL_MEM_MALLOC_HUGE_FIRST);
-    aclrtMalloc(&coordDev, coordBytes, ACL_MEM_MALLOC_HUGE_FIRST);
-    aclrtMalloc(&nptsDev, nptsBytes, ACL_MEM_MALLOC_HUGE_FIRST);
-    aclrtMalloc(&nvoxDev, nvoxBytes, ACL_MEM_MALLOC_HUGE_FIRST);
+    funcs.rtMalloc(&voxDev, voxBytes, kAclMemMallocHugeFirst);
+    funcs.rtMalloc(&coordDev, coordBytes, kAclMemMallocHugeFirst);
+    funcs.rtMalloc(&nptsDev, nptsBytes, kAclMemMallocHugeFirst);
+    funcs.rtMalloc(&nvoxDev, nvoxBytes, kAclMemMallocHugeFirst);
 
-    std::vector<int64_t> inShape = {N, 4};
-    std::vector<int64_t> inStrides = {4, 1};
-    aclTensor* ptsTensor = aclCreateTensor(inShape.data(), 2, ACL_FLOAT, inStrides.data(),
-                                           ACL_FORMAT_ND, ACL_FORMAT_ND, inShape.data(), 2,
-                                           points.data_ptr());
-
-    aclTensor* voxTensor = MakeTensorFromPtr(ACL_FLOAT, {max_voxels, max_num_points, 4}, voxDev);
-    aclTensor* coordTensor = MakeTensorFromPtr(ACL_INT32, {max_voxels, 3}, coordDev);
-    aclTensor* nptsTensor = MakeTensorFromPtr(ACL_INT32, {max_voxels}, nptsDev);
-    aclTensor* nvoxTensor = MakeTensorFromPtr(ACL_INT32, {1}, nvoxDev);
+    aclTensor* ptsTensor = MakeTensor(/*ACL_FLOAT*/ 0, {N, 4}, points.data_ptr());
+    aclTensor* voxTensor = MakeTensor(/*ACL_FLOAT*/ 0, {max_voxels, max_num_points, 4}, voxDev);
+    aclTensor* coordTensor = MakeTensor(/*ACL_INT32*/ 3, {max_voxels, 3}, coordDev);
+    aclTensor* nptsTensor = MakeTensor(/*ACL_INT32*/ 3, {max_voxels}, nptsDev);
+    aclTensor* nvoxTensor = MakeTensor(/*ACL_INT32*/ 3, {1}, nvoxDev);
 
     float vs[3] = {(float)voxel_size[0], (float)voxel_size[1], (float)voxel_size[2]};
     float pcrArr[6] = {(float)pcr[0], (float)pcr[1], (float)pcr[2],
                        (float)pcr[3], (float)pcr[4], (float)pcr[5]};
-    aclFloatArray* vsArr = aclCreateFloatArray(vs, 3);
-    aclFloatArray* pcrArrAc = aclCreateFloatArray(pcrArr, 6);
+    aclFloatArray* vsArr = funcs.createFloatArray(vs, 3);
+    aclFloatArray* pcrArrAc = funcs.createFloatArray(pcrArr, 6);
 
     uint64_t workspaceSize = 0;
     aclOpExecutor* executor = nullptr;
-    aclnnStatus st = aclnnVoxelizationGetWorkspaceSize(
+    aclError st = funcs.getWorkspaceSize(
         ptsTensor, vsArr, pcrArrAc, max_num_points, max_voxels,
         voxTensor, coordTensor, nptsTensor, nvoxTensor,
         &workspaceSize, &executor);
-    TORCH_CHECK(st == ACL_SUCCESS, "aclnnVoxelizationGetWorkspaceSize failed: ", st);
+    TORCH_CHECK(st == 0, "aclnnVoxelizationGetWorkspaceSize failed: ", st);
 
     void* wsDev = nullptr;
     if (workspaceSize > 0) {
-        aclrtMalloc(&wsDev, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
+        funcs.rtMalloc(&wsDev, workspaceSize, kAclMemMallocHugeFirst);
     }
 
-    st = aclnnVoxelization(wsDev, workspaceSize, executor, aclStream);
-    TORCH_CHECK(st == ACL_SUCCESS, "aclnnVoxelization failed: ", st);
-    aclrtSynchronizeStream(aclStream);
+    st = funcs.run(wsDev, workspaceSize, executor, aclStream);
+    TORCH_CHECK(st == 0, "aclnnVoxelization failed: ", st);
+    funcs.rtSync(aclStream);
 
     int32_t nvox[16];
-    aclrtMemcpy(nvox, nvoxBytes, nvoxDev, nvoxBytes, ACL_MEMCPY_DEVICE_TO_HOST);
+    funcs.rtMemcpy(nvox, nvoxBytes, nvoxDev, nvoxBytes, kAclMemcpyDeviceToHost);
 
     at::Tensor voxels = at::empty({max_voxels, max_num_points, 4}, points.options().dtype(at::kFloat));
     at::Tensor coords = at::empty({max_voxels, 3}, points.options().dtype(at::kInt));
     at::Tensor num_points = at::empty({max_voxels}, points.options().dtype(at::kInt));
     at::Tensor num_voxels = at::empty({1}, points.options().dtype(at::kInt));
 
-    aclrtMemcpy(voxels.mutable_data_ptr(), voxBytes, voxDev, voxBytes, ACL_MEMCPY_DEVICE_TO_DEVICE);
-    aclrtMemcpy(coords.mutable_data_ptr(), coordBytes, coordDev, coordBytes, ACL_MEMCPY_DEVICE_TO_DEVICE);
-    aclrtMemcpy(num_points.mutable_data_ptr(), nptsBytes, nptsDev, nptsBytes, ACL_MEMCPY_DEVICE_TO_DEVICE);
-    aclrtMemcpy(num_voxels.mutable_data_ptr(), 4, nvoxDev, 4, ACL_MEMCPY_DEVICE_TO_DEVICE);
+    funcs.rtMemcpy(voxels.mutable_data_ptr(), voxBytes, voxDev, voxBytes, kAclMemcpyDeviceToDevice);
+    funcs.rtMemcpy(coords.mutable_data_ptr(), coordBytes, coordDev, coordBytes, kAclMemcpyDeviceToDevice);
+    funcs.rtMemcpy(num_points.mutable_data_ptr(), nptsBytes, nptsDev, nptsBytes, kAclMemcpyDeviceToDevice);
+    funcs.rtMemcpy(num_voxels.mutable_data_ptr(), 4, nvoxDev, 4, kAclMemcpyDeviceToDevice);
 
-    aclDestroyTensor(ptsTensor);
-    aclDestroyTensor(voxTensor); aclDestroyTensor(coordTensor);
-    aclDestroyTensor(nptsTensor); aclDestroyTensor(nvoxTensor);
-    aclDestroyFloatArray(vsArr); aclDestroyFloatArray(pcrArrAc);
-    aclrtFree(voxDev); aclrtFree(coordDev); aclrtFree(nptsDev); aclrtFree(nvoxDev);
-    if (wsDev) aclrtFree(wsDev);
+    funcs.destroyTensor(ptsTensor);
+    funcs.destroyTensor(voxTensor); funcs.destroyTensor(coordTensor);
+    funcs.destroyTensor(nptsTensor); funcs.destroyTensor(nvoxTensor);
+    funcs.destroyFloatArray(vsArr); funcs.destroyFloatArray(pcrArrAc);
+    funcs.rtFree(voxDev); funcs.rtFree(coordDev); funcs.rtFree(nptsDev); funcs.rtFree(nvoxDev);
+    if (wsDev) funcs.rtFree(wsDev);
 
     return {voxels, coords, num_points, num_voxels};
 }
