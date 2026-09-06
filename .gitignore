@@ -17,3 +17,7 @@ csrc/ascend/custom_op_temp/
 kernel_meta/
 extra-info/
 mindstudio_sanitizer_log/
+
+# Build artifacts
+dist/
+*.egg-info/
