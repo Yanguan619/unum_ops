@@ -161,6 +161,18 @@ def _build_opp_and_install(root: str, ext: dict, ascend_home: str, system_py: st
         print(f"[unum_ops] {name}: installing OPP into {target_opp} ...")
         shutil.copytree(pkg_dir, target_opp, dirs_exist_ok=True)
         print(f"[unum_ops] {name}: OPP installed successfully")
+
+        # 更新 config.ini：确保 vendor 在 load_priority 中
+        config_path = os.path.join(ascend_home, "opp", "vendors", "config.ini")
+        if os.path.isfile(config_path):
+            with open(config_path) as f:
+                content = f.read()
+            if vendor_name not in content:
+                new_content = content.rstrip() + f",{vendor_name}\n"
+                with open(config_path, "w") as f:
+                    f.write(new_content)
+                print(f"[unum_ops] added '{vendor_name}' to {config_path}")
+
         return True
     else:
         print(f"[unum_ops] {name}: OPP package built but install directory not found at {pkg_dir}")
@@ -181,7 +193,8 @@ def _build_ascend_extension(root: str, ext: dict, ascend_home: str) -> bool:
         return True
 
     # 检查 / 构建 OPP 内核包（提供 ACLNN 头文件）
-    op_api_inc = os.path.join(ascend_home, "opp", "vendors", "customize", "op_api", "include")
+    vendor_name = ext["vendor"]
+    op_api_inc = os.path.join(ascend_home, "opp", "vendors", vendor_name, "op_api", "include")
     headers_missing = [h for h in ext.get("require_headers", [])
                        if not os.path.isfile(os.path.join(op_api_inc, h))]
     if headers_missing:
@@ -190,7 +203,7 @@ def _build_ascend_extension(root: str, ext: dict, ascend_home: str) -> bool:
         if not _build_opp_and_install(root, ext, ascend_home, system_py):
             print(f"[unum_ops] {name}: OPP build+install failed, cannot build {so_name}")
             return False
-        # 再次检查头文件
+        # 再次检查头文件（已安装到 vendor 目录）
         still_missing = [h for h in headers_missing
                          if not os.path.isfile(os.path.join(op_api_inc, h))]
         if still_missing:
