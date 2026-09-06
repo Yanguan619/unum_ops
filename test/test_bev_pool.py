@@ -17,11 +17,6 @@ import torch_npu
 torch.npu.set_compile_mode(jit_compile=False)
 torch.npu.set_device(0)
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_PKG_ROOT = os.path.normpath(os.path.join(_HERE, "..", "src", "unum_ops"))
-if _PKG_ROOT not in sys.path:
-    sys.path.insert(0, _PKG_ROOT)
-
 from unum_ops.bev_pool import bev_pool, bev_pool_torch
 
 
