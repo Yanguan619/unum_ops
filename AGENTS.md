@@ -7,30 +7,36 @@
 bash csrc/ascend/bev_pool/rebuild_install.sh
 python -m pytest test/test_bev_pool.py -q
 
+# voxelization: build OPP + op_extension + test
+cd csrc/ascend/voxelization && rm -rf build_out && bash build.sh && \
+  PKG_DIR="build_out/_CPack_Packages/Linux/External/custom_opp_openEuler_aarch64.run/packages/vendors/voxelization" && \
+  cp -a "$PKG_DIR/." /usr/local/Ascend/cann-9.0.0/opp/vendors/voxelization/ && \
+  cd op_extension && rm -rf build && mkdir build && cd build && \
+  TORCH_CMAKE=$(python3 -c "import torch; print(torch.utils.cmake_prefix_path)") && \
+  cmake .. -DASCEND_HOME_PATH=/usr/local/Ascend/cann-9.0.0 -DCMAKE_PREFIX_PATH="$TORCH_CMAKE" && \
+  make -j4 && cd /workspace/unum_ops && \
+  python -m pytest test/test_voxelization.py -q
+
 # spconv tests
 python -m pytest test/test_spconv.py -q
 
 # all tests
-python -m pytest test/test_spconv.py test/test_bev_pool.py -q
+python -m pytest test/test_spconv.py test/test_bev_pool.py test/test_voxelization.py -q
 ```
 
+## Completed
+
+- [x] **bev_pool Python wrapper rank 精度**: `ranks.float().argsort()` → `ranks.argsort()` (int64)
+- [x] **bev_pool binding 缺少输入验证**: 加 14 个 TORCH_CHECK (dtype/device/contiguous/shape)
+- [x] **bev_pool kernel 无 start 下标越界检查**: 3 处加 `start+length > numPoints` 防护
+- [x] **host tiling gridTotal uint32 溢出**: uint64 计算 + 校验 `<= UINT32_MAX`
+- [x] **build.sh 缺少 set -e 且版本比较有 bug**: 加 set -e + `sort -V` 版本比较
+- [x] **rebuild_install.sh 硬编码路径**: 动态 ASCEND_HOME_PATH + 动态查找 PKG_DIR
+- [x] **测试缺少边缘覆盖**: 16 个测试 (OOB/C=0/dtype/非连续/rank int64/网格维度)
+- [x] **spconv 正确性 bug**: SubM padding/stride/dilation, 2D _triple, dense()/from_dense() device, VoxelGenerator, _gather edge
+- [x] **voxelization 算子**: 独立 vendor + dlopen 统一加载, 20 测试通过, ~2x numpy 性能
+
 ## Remaining TODOs (by priority)
-
-### 🔴 High
-
-- [ ] **bev_pool Python wrapper rank 精度** (`src/unum_ops/bev_pool/__init__.py:104`): `ranks.float().argsort()` 当 `B*D*H*W > 2^24` 时 float32 精度不足，不同 voxel 碰撞。改为 `ranks.argsort()`（int64 排序）
-
-- [ ] **bev_pool binding 缺少输入验证** (`csrc/ascend/bev_pool/op_extension/bev_pool_torch.cpp:88-95`): 无 dtype、device、contiguous、shape 检查 → 非连续/CPU/float16 输入静默错
-
-- [ ] **bev_pool kernel 无 start 下标越界检查** (`op_kernel/bev_pool.cpp:58-105`): 当 `start > numPoints` 时 coordPtr_/featsPtr_ 读越界
-
-- [ ] **host tiling gridTotal uint32 溢出** (`op_host/bev_pool.cpp:38`): `B*D*H*W` 用 uint32 计算，乘积 > 2^32 时溢出为 0 → kernel 写越界
-
-- [ ] **build.sh 缺少 set -e 且版本比较有 bug** (`build.sh:1,36`): cmake 版本字符串比较 `3.10.0 < 3.19.0` 错误；`cmake --build` 失败不中断
-
-- [ ] **rebuild_install.sh 硬编码路径** (`rebuild_install.sh:7,10`): CANN 版本 `cann-9.0.0`, 架构 `aarch64`, 发行版 `openEuler` 硬编码
-
-- [ ] **测试缺少边缘覆盖** (`test/test_bev_pool.py`): 无 OOB 坐标、C=0、N=0、非连续输入、dtype 异常测试
 
 ### 🟡 Medium
 
