@@ -65,6 +65,7 @@ class UnumOpsMetadataHook(MetadataHookInterface):
 _EXTENSIONS = [
     {
         "name": "bev_pool",
+        "vendor": "bev_pool",
         "src_dir": "csrc/ascend/bev_pool/op_extension",
         "so_name": "libbev_pool_ops.so",
         "require_headers": ["aclnn_bev_pool.h"],
@@ -72,6 +73,7 @@ _EXTENSIONS = [
     },
     {
         "name": "voxelization",
+        "vendor": "voxelization",
         "src_dir": "csrc/ascend/voxelization/op_extension",
         "so_name": "libvoxelization_ops.so",
         "require_headers": ["aclnn_voxelization.h"],
@@ -131,9 +133,10 @@ def _build_opp_and_install(root: str, ext: dict, ascend_home: str, system_py: st
         return False
 
     # 安装 OPP 到 CANN vendors（使头文件在 op_api/include 下可见）
+    vendor_name = ext["vendor"]
     pkg_dir = os.path.join(
         build_out, "_CPack_Packages", "Linux", "External",
-        "custom_opp_openEuler_aarch64.run", "packages", "vendors", "customize",
+        "custom_opp_openEuler_aarch64.run", "packages", "vendors", vendor_name,
     )
     if not os.path.isdir(pkg_dir):
         # 尝试 .run 文件直接安装
@@ -148,11 +151,11 @@ def _build_opp_and_install(root: str, ext: dict, ascend_home: str, system_py: st
                     env=env, timeout=120,
                 )
                 pkg_dir = os.path.join(build_out, "_CPack_Packages", "Linux", "External",
-                                       "custom_opp_openEuler_aarch64.run", "packages", "vendors", "customize")
+                                       "custom_opp_openEuler_aarch64.run", "packages", "vendors", vendor_name)
             except Exception:
                 pass
 
-    target_opp = os.path.join(ascend_home, "opp", "vendors", "customize")
+    target_opp = os.path.join(ascend_home, "opp", "vendors", vendor_name)
     if os.path.isdir(pkg_dir):
         import shutil
         print(f"[unum_ops] {name}: installing OPP into {target_opp} ...")
