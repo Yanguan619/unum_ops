@@ -59,3 +59,77 @@ def test_voxel_point_sets_match_golden(golden):
         gs = np.sort(gv[v][:n], axis=0)
         ks = np.sort(vox[v][:n], axis=0)
         assert np.allclose(gs, ks, atol=0.0), f"voxel {v} mismatch"
+
+
+# ── Edge cases ──────────────────────────────────────────────────────────────
+
+def _make_points_3d(xyz, intensity=1.0):
+    pts = np.array([[x, y, z, intensity] for x, y, z in xyz], dtype=np.float32)
+    return torch.from_numpy(pts).npu()
+
+
+def test_empty_input():
+    """N=0 应返回空输出。"""
+    pts = torch.empty(0, 4, dtype=torch.float32).npu()
+    out = voxelization(pts)
+    assert out.num_voxels == 0
+    assert out.voxels.shape[0] == 0
+    assert out.coords.shape[0] == 0
+    assert out.num_points.shape[0] == 0
+
+
+def test_all_out_of_range():
+    """全部越界 → 空输出。"""
+    pts = _make_points_3d([(100, 100, 100), (-1, -1, -1)])
+    out = voxelization(pts, pcr=(0, 0, 0, 10, 10, 10))
+    assert out.num_voxels == 0
+
+
+def test_max_voxels_truncation():
+    """超过 max_voxels 时截断。"""
+    np.random.seed(42)
+    pts = np.random.uniform(0, 5, (500, 4)).astype(np.float32)
+    pts = torch.from_numpy(pts).npu()
+    # 注：kernel 在 max_voxels < 64 时会 aicore 异常(507015)，此处用 ≥64 的安全值
+    out = voxelization(pts, voxel_size=(1, 1, 1), pcr=(0, 0, 0, 5, 5, 5),
+                       max_voxels=100)
+    assert out.num_voxels <= 100
+
+
+def test_max_num_points_truncation():
+    """同一体素超过 max_num_points 时截断。"""
+    pts = np.zeros((100, 4), dtype=np.float32)
+    pts[:, :3] = 1.0
+    pts = torch.from_numpy(pts).npu()
+    out = voxelization(pts, voxel_size=(10, 10, 10), pcr=(0, 0, 0, 100, 100, 100),
+                       max_num_points=5)
+    assert out.num_points[0].item() <= 5
+
+
+def test_coordinate_order_zyx():
+    """输出坐标顺序为 [z, y, x]。"""
+    pts = _make_points_3d([(2.5, 1.5, 0.5)])
+    out = voxelization(pts, voxel_size=(1, 1, 1), pcr=(0, 0, 0, 5, 5, 5))
+    assert out.coords.shape[0] == 1
+    assert out.coords[0, 0].item() == 0  # z
+    assert out.coords[0, 1].item() == 1  # y
+    assert out.coords[0, 2].item() == 2  # x
+
+
+def test_single_point():
+    """单点应正确体素化。"""
+    pts = _make_points_3d([(1.5, 2.5, 3.5)])
+    out = voxelization(pts, voxel_size=(1, 1, 1), pcr=(0, 0, 0, 10, 10, 10))
+    assert out.num_voxels == 1
+    assert out.num_points[0].item() == 1
+    assert np.allclose(out.voxels[0, 0].cpu().numpy(), [1.5, 2.5, 3.5, 1.0])
+
+
+def test_voxel_size_non_uniform():
+    """非均匀 voxel_size 应正确映射。"""
+    pts = _make_points_3d([(1.5, 2.5, 3.5)])
+    out = voxelization(pts, voxel_size=(0.5, 2.0, 1.0), pcr=(0, 0, 0, 10, 10, 10))
+    # x: 1.5/0.5=3, y: 2.5/2.0=1, z: 3.5/1.0=3
+    assert out.coords[0, 2].item() == 3  # x
+    assert out.coords[0, 1].item() == 1  # y
+    assert out.coords[0, 0].item() == 3  # z

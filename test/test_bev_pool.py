@@ -201,17 +201,6 @@ def test_all_oob_points():
     assert torch.all(out.cpu() == 0.0), "all OOB points should produce zero output"
 
 
-def test_all_oob_points():
-    """所有点都越界 → 输出全零。"""
-    B, D, H, W, C = 1, 2, 4, 4, 8
-    N = 20
-    feats, coords = _make_points(N, B, D, H, W, C, seed=6)
-    coords_oob = coords.clone()
-    coords_oob[:, 0] = -2  # 全部 x 越界
-    out = _run(feats, coords_oob, B, D, H, W)
-    assert torch.all(out.cpu() == 0.0)
-
-
 def test_rank_int64_no_float_collision():
     """rank 用 int64 排序，大网格下不因 float32 精度碰撞而错。"""
     # 构造 W < H 且 rank 值很大的情况（旧公式 float 会碰撞）

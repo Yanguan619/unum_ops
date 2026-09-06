@@ -59,6 +59,12 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     uint64_t offScratch = offBlockSum + (uint64_t)blockNum * 8 * sizeof(int32_t);
     uint64_t workspaceSize = offScratch + (uint64_t)padN * 8 * sizeof(int32_t);
 
+    // 校验 workspace 是否在 voxels 输出 buffer 内
+    uint64_t voxBufferBytes = (uint64_t)maxVoxels * (uint64_t)maxNumPoints * 4 * sizeof(float);
+    if (workspaceSize > voxBufferBytes) {
+        return ge::GRAPH_FAILED;
+    }
+
     memset(tiling, 0, sizeof(VoxelizationTilingData));
     tiling->numPoints = numPoints;
     tiling->padNumPoints = padN;

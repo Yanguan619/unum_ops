@@ -47,6 +47,16 @@ python -m pytest test/test_spconv.py test/test_bev_pool.py test/test_voxelizatio
 - [x] **死代码**: 删除 NPUBridge、NPUStorageImpl、op_api_common.h、utils.h
 - [x] **长稳压测**: `test_stability.py` 1500 次迭代 0 错误
 - [x] **`.gitignore` 排除 `benchmark/output/`**
+- [x] **voxelization 测试补边界**: 空输入/全部越界/max_voxels截断/max_num_points截断/坐标顺序/非均匀voxel_size
+- [x] **bev_pool benchmark 补多维度**: 不同 C/D/H/W 组合
+- [x] **spconv benchmark**: `benchmark/bench_spconv.py` 回归基准
+- [x] **voxelization benchmark 补参数**: 不同 voxel_size/PCR 组合
+- [x] **test_bev_pool.py 去重**: 删除重复的 `test_all_oob_points`
+
+## Known Bugs (已修复)
+
+- [x] **voxelization kernel max_voxels < 64 时 aicore 异常(507015)**: 根因是 workspace 放在 voxels 输出 buffer 内，小 max_voxels 时 buffer 容量不足。host 侧增加 `workspaceSize > voxBufferBytes` 校验，返回 GRAPH_FAILED 干净报错代替崩溃。
+- [x] **voxelization kernel 小 voxel_size 大网格 aicore 异常**: 同根因（gridTotal 过大 → workspace 超 voxels buffer）。同一校验解决。
 
 ## Voxelization 性能
 
@@ -62,7 +72,7 @@ python -m pytest test/test_spconv.py test/test_bev_pool.py test/test_voxelizatio
 全部完成。项目当前状态：
 
 - 3 个 AscendC 算子：bev_pool ✅ / voxelization ✅ / spconv ✅
-- 82 个测试全部通过，1500 次长稳压测 0 错误
+- 89 个测试全部通过，1500 次长稳压测 0 错误
 - 多 vendor 独立部署，统一 dlopen 加载，无冲突
 - pip install 时自动编译 AscendC 扩展 .so
 - 持续维护：`AGENTS.md` 记录所有已知问题和修复状态
