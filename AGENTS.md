@@ -23,6 +23,9 @@ python -m pytest benchmark/bench_voxelization.py -v
 # spconv tests
 python -m pytest test/test_spconv.py -q
 
+# stability test
+python -m pytest test/test_stability.py -v
+
 # all tests
 python -m pytest test/test_spconv.py test/test_bev_pool.py test/test_voxelization.py -q
 ```
@@ -39,6 +42,11 @@ python -m pytest test/test_spconv.py test/test_bev_pool.py test/test_voxelizatio
 - [x] **spconv 正确性 bug**: SubM padding/stride/dilation, 2D _triple, dense()/from_dense() device, VoxelGenerator, _gather edge
 - [x] **voxelization 算子**: 独立 vendor + dlopen 统一加载, 20 测试通过
 - [x] **voxelization 性能优化**: wrapper 免 D2D 拷贝, 固定开销 ~7ms→~2.5ms (-64%)
+- [x] **README.md 虚假声明**: 重写 README，准确描述 AscendC/torch 算子
+- [x] **pyproject.toml 控制台脚本**: 添加 `main()` 函数; 更新 description
+- [x] **死代码**: 删除 NPUBridge、NPUStorageImpl、op_api_common.h、utils.h
+- [x] **长稳压测**: `test_stability.py` 1500 次迭代 0 错误
+- [x] **`.gitignore` 排除 `benchmark/output/`**
 
 ## Voxelization 性能
 
@@ -53,17 +61,10 @@ python -m pytest test/test_spconv.py test/test_bev_pool.py test/test_voxelizatio
 
 ### 🟡 Medium
 
-- [ ] **README.md 虚假声明**: "此项目算子全部为 torch/triton 实现" → `bev_pool` 是 AscendC
-
 - [ ] **.so 加载路径脆弱** (`src/unum_ops/bev_pool/__init__.py:23-25`): `_SO_REL` 相对源码树，`pip install` 到 site-packages 后找不到
 
-- [ ] **pyproject.toml 控制台脚本不存在** (`pyproject.toml:30`): `unum_ops = "unum_ops:main"` 但 `main()` 不存在
-
 - [ ] **输出形状不匹配**: `InferShape` 声明 5D `[B,D,H,W,C]`，实际返回 2D `[gridTotal, C]`。CANN 未来版本若加形状验证会崩溃
-
-- [ ] **死代码**: `op_extension/NPUBridge.cpp`, `NPUStorageImpl.cpp` 未在 CMake 中编译，可删除
 
 ### 🟢 Low
 
 - [ ] 许可证头不一致（华为 OSL vs BSD 3-Clause vs 无头）
-- [ ] `.gitignore` 未排除 `benchmark/output/`
