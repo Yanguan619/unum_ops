@@ -201,6 +201,11 @@ def print_310p_interfaces() -> None:
             print(f"{mod+'.'+name:<42} {tag:<6} {reason}")
 
 
+def main() -> None:
+    """控制台入口：`unum_ops` 打印设备与接口可用性。"""
+    print_310p_interfaces()
+
+
 __all__ = [
     "infllm_v2",
     "sparse_kernel_extension",

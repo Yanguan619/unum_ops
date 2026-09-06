@@ -21,3 +21,4 @@ mindstudio_sanitizer_log/
 # Build artifacts
 dist/
 *.egg-info/
+benchmark/output/

@@ -1,7 +1,7 @@
 [project]
 name = "unum_ops"
 version = "0.1.0"
-description = "Add your description here"
+description = "Ascend 310P / CPU / GPU 多硬件适配算子集合（bev_pool, voxelization, spconv）"
 readme = "README.md"
 authors = [
     { name = "Yanguan02", email = "yanguan_02@126.com" }
