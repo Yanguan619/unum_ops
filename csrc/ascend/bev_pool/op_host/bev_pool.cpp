@@ -45,10 +45,6 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     uint32_t coreNum = (platform != nullptr) ? platform->GetCoreNumAiv() : BEV_MAX_CORES;
     uint32_t blockNum = (coreNum < BEV_MAX_CORES) ? coreNum : BEV_MAX_CORES;
     bool channelAligned = (numChannels % 8 == 0);
-    // 标量路径（C 非 8 倍数）用单核：310P 标量 GM 写操作在多核间无缓存一致性
-    if (!channelAligned) {
-        blockNum = 1;
-    }
 
     uint32_t intervalsPerCore = (numIntervals + blockNum - 1) / blockNum;
 
