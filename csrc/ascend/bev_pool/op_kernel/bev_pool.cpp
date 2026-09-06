@@ -36,6 +36,7 @@ public:
 
         const uint32_t C = t_->numChannels;
         pipe_->InitBuffer(bufAcc_, C * sizeof(float));
+        pipe_->InitBuffer(bufAcc1_, C * sizeof(float));
         pipe_->InitBuffer(bufChunk_, (int64_t)t_->tilePoints * ((int64_t)t_->numChannels) * sizeof(float));
     }
 
@@ -120,6 +121,7 @@ private:
         const uint32_t cap = t_->tilePoints;
         AscendC::LocalTensor<float> chunk = bufChunk_.Get<float>();
         AscendC::LocalTensor<float> acc = bufAcc_.Get<float>();
+        AscendC::LocalTensor<float> acc1 = bufAcc1_.Get<float>();
 
         // ---- Load phase: 累积连续 interval 的点行直到块容量 ----
         // 所有 ln > 0 的 interval（包括 OOB）都计入 rowOff，
@@ -150,12 +152,14 @@ private:
 
         // 单次大 DataCopy 装载整个块的多行（连续 GM 区域，含 OOB 行）。
         AscendC::DataCopy(chunk, featsGm_[(int64_t)firstStart * C], (int32_t)(rowOff * C));
-        AscendC::PipeBarrier<PIPE_ALL>();
+        AscendC::PipeBarrier<PIPE_MTE2>();
 
         // ---- Compute phase: 逐 interval 在 UB 内累加并写出 ----
-        // coff 对所有 ln > 0 的 interval 前进（包括 OOB），保持与 chunk 内行偏移对齐。
-        // 仅 in-bounds interval 执行累加 + 写出；OOB interval 跳过累加但仍前进 coff。
+        // 双缓冲：两个 acc 交替。当前 interval 的 Duplicate+Add(V pipe) 与
+        // 上一 interval 的 DataCopy(out)(MTE3 pipe) 重叠，隐藏 MTE3 写延迟。
         int64_t coff = 0;
+        uint32_t bufIdx = 0;
+        bool pendingWrite = false;
         for (uint32_t j = iv0; j < iv; j++) {
             int32_t s = startsPtr_[j];
             int32_t ln = lengthsPtr_[j];
@@ -164,18 +168,24 @@ private:
             }
             if (InBounds((uint32_t)s)) {
                 uint64_t outOff = OutputOffset((uint32_t)s);
-                AscendC::Duplicate<float>(acc, 0.0f, (int32_t)C);
-                AscendC::PipeBarrier<PIPE_ALL>();
+                AscendC::LocalTensor<float> cur = (bufIdx == 0) ? acc : acc1;
+                AscendC::Duplicate<float>(cur, 0.0f, (int32_t)C);
                 for (int32_t r = 0; r < ln; r++) {
-                    AscendC::Add(acc, acc, chunk[(int64_t)(coff + r) * C], (int32_t)C);
+                    AscendC::Add(cur, cur, chunk[(int64_t)(coff + r) * C], (int32_t)C);
                 }
-                AscendC::PipeBarrier<PIPE_ALL>();
-                AscendC::DataCopy(outGm_[outOff], acc, (int32_t)C);
-                AscendC::PipeBarrier<PIPE_ALL>();
+                AscendC::PipeBarrier<PIPE_V>();
+                if (pendingWrite) {
+                    AscendC::PipeBarrier<PIPE_MTE3>();
+                }
+                AscendC::DataCopy(outGm_[outOff], cur, (int32_t)C);
+                pendingWrite = true;
+                bufIdx ^= 1;
             }
             coff += ln;
         }
-        AscendC::PipeBarrier<PIPE_MTE3>();
+        if (pendingWrite) {
+            AscendC::PipeBarrier<PIPE_MTE3>();
+        }
         return iv;
     }
 
@@ -229,6 +239,7 @@ private:
     AscendC::GlobalTensor<float> featsGm_;
     AscendC::GlobalTensor<float> outGm_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> bufAcc_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> bufAcc1_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> bufChunk_;
 };
 
