@@ -2,15 +2,40 @@
 #include "bev_pool_tiling.h"
 
 /* BevPool kernel — LSS Splat 阶段的 segment-sum scatter。
+ *
  * 输入（已按 rank 排序）：feats [N, C]，coords [N, 4]=(x,y,z,batch)，
- * interval_starts [K]，interval_lengths [K]。
+ *   interval_starts [K]，interval_lengths [K]。
  * 输出：out [B, D, H, W, C]。
  *
- * 每个 interval 对应一个唯一 voxel，其所有点映射到同一输出位置。
- * 多核按 interval 分区，无跨核写冲突。
+ * 每个 interval 对应一个唯一 voxel，其点累加后写入该 voxel 位置。
+ * 多核按 interval 区间分区，各核写不同的 voxel，无跨核写冲突。
+ *
+ * 性能要点：
+ *  - 排序后连续 interval 的点行在 GM 中连续 → 块 DataCopy 一次装载多行
+ *  - starts/lengths/coords 批量读入 UB，避免逐 interval GM 标量读
+ *  - 双 acc 缓冲让 V 累加与 MTE3 写出重叠
  */
 
 __aicore__ inline uint32_t BevMinU(uint32_t a, uint32_t b) { return a < b ? a : b; }
+
+// 坐标是否落在网格内（从 UB coords 读取，偏移 = 行号 * 4）
+__aicore__ inline bool CoordInGrid(int32_t bx, int32_t by, int32_t bz, int32_t batch,
+                                   const BevPoolTilingData* t)
+{
+    if (bx < 0 || bx >= (int32_t)t->gridW) return false;
+    if (by < 0 || by >= (int32_t)t->gridH) return false;
+    if (bz < 0 || bz >= (int32_t)t->gridD) return false;
+    if (batch < 0 || batch >= (int32_t)t->gridB) return false;
+    return true;
+}
+
+// 平坦 voxel 偏移（元素单位），供 GM 写使用
+__aicore__ inline uint64_t CoordOffset(int32_t bx, int32_t by, int32_t bz, int32_t batch,
+                                       const BevPoolTilingData* t)
+{
+    uint64_t off = ((uint64_t)batch * t->gridD + (uint64_t)bz) * t->gridH + (uint64_t)by;
+    return (off * t->gridW + (uint64_t)bx) * t->numChannels;
+}
 
 class KernelBevPool {
 public:
@@ -37,13 +62,13 @@ public:
         lengthsGm_.SetGlobalBuffer(lengthsPtr_, (int64_t)tiling->numIntervals);
         coordsGm_.SetGlobalBuffer(coordPtr_, (int64_t)tiling->numPoints * 4);
 
-        const uint32_t C = t_->numChannels;
+        const uint32_t C = tiling->numChannels;
         pipe_->InitBuffer(bufAcc_, C * sizeof(float));
         pipe_->InitBuffer(bufAcc1_, C * sizeof(float));
-        pipe_->InitBuffer(bufStarts_, BEV_TILE_POINTS * sizeof(int32_t));
-        pipe_->InitBuffer(bufLengths_, BEV_TILE_POINTS * sizeof(int32_t));
-        pipe_->InitBuffer(bufCoords_, BEV_MAX_TILE_POINTS * 4 * sizeof(int32_t));
-        pipe_->InitBuffer(bufChunk_, (int64_t)t_->tilePoints * ((int64_t)t_->numChannels) * sizeof(float));
+        pipe_->InitBuffer(bufStarts_, (int64_t)tiling->tilePoints * sizeof(int32_t));
+        pipe_->InitBuffer(bufLengths_, (int64_t)tiling->tilePoints * sizeof(int32_t));
+        pipe_->InitBuffer(bufCoords_, (int64_t)tiling->tilePoints * 4 * sizeof(int32_t));
+        pipe_->InitBuffer(bufChunk_, (int64_t)tiling->tilePoints * ((int64_t)tiling->numChannels) * sizeof(float));
     }
 
     __aicore__ inline void Process()
@@ -132,34 +157,25 @@ private:
         AscendC::LocalTensor<int32_t> lengthsUb = bufLengths_.Get<int32_t>();
 
         // ---- Load phase: 累积连续 interval 的点行直到块容量 ----
-        // 所有 ln > 0 的 interval（包括 OOB）都计入 rowOff，
-        // 因为它们的行在 GM 中连续排列。
-        // 批量 DataCopy 读 starts/lengths 到 UB，避免逐 interval GM 标量读（scalar 瓶颈）
+        // 批量 DataCopy 读 starts/lengths 到 UB，避免逐 interval GM 标量读
         uint32_t iv = iv0;
-        uint32_t avail = BevMinU(BEV_TILE_POINTS, endInt_ - iv0);
-        AscendC::DataCopy(startsUb, startsGm_[iv0], (int32_t)avail);
-        AscendC::DataCopy(lengthsUb, lengthsGm_[iv0], (int32_t)avail);
+        uint32_t nIntervals = BevMinU(cap, endInt_ - iv0);
+        AscendC::DataCopy(startsUb, startsGm_[iv0], (int32_t)nIntervals);
+        AscendC::DataCopy(lengthsUb, lengthsGm_[iv0], (int32_t)nIntervals);
         AscendC::PipeBarrier<PIPE_MTE2>();
-        uint32_t availIdx = 0;
         int64_t rowOff = 0;
         int64_t firstStart = -1;
-        while (iv < endInt_ && availIdx < avail) {
-            int32_t s = startsUb.GetValue(availIdx);
-            int32_t ln = lengthsUb.GetValue(availIdx);
+        uint32_t idx = 0;
+        while (iv < endInt_ && idx < nIntervals) {
+            int32_t s = startsUb.GetValue(idx);
+            int32_t ln = lengthsUb.GetValue(idx);
             if (ln <= 0 || (uint32_t)(s + ln) > t_->numPoints) {
-                iv++;
-                availIdx++;
-                continue;
+                iv++; idx++; continue;
             }
-            if (firstStart < 0) {
-                firstStart = s;
-            }
-            if ((int64_t)ln > (int64_t)cap - rowOff) {
-                break;
-            }
+            if (firstStart < 0) firstStart = s;
+            if ((int64_t)ln > (int64_t)cap - rowOff) break;
             rowOff += ln;
-            iv++;
-            availIdx++;
+            iv++; idx++;
         }
         if (rowOff == 0) {
             // 首 interval 就超容量（或全为空）→ 单独处理这个大 interval。
@@ -176,42 +192,37 @@ private:
         AscendC::PipeBarrier<PIPE_MTE2>();
 
         // ---- Compute phase: 逐 interval 在 UB 内累加并写出 ----
-        // 双缓冲：两个 acc 交替。当前 interval 的 Duplicate+Add(V pipe) 与
-        // 上一 interval 的 DataCopy(out)(MTE3 pipe) 重叠，隐藏 MTE3 写延迟。
+        // 双缓冲：两个 acc 交替，让当前 interval 的 V 计算与上一 interval 的
+        // MTE3 写出重叠，隐藏写延迟。coff 对所有 ln>0 的 interval 前进。
         int64_t coff = 0;
         uint32_t bufIdx = 0;
         bool pendingWrite = false;
-        for (uint32_t j = iv0; j < iv; j++) {
-            int32_t s = startsUb.GetValue(j - iv0);
-            int32_t ln = lengthsUb.GetValue(j - iv0);
+        for (uint32_t k = 0; k < idx; k++) {
+            int32_t s = startsUb.GetValue(k);
+            int32_t ln = lengthsUb.GetValue(k);
             if (ln <= 0 || (uint32_t)(s + ln) > t_->numPoints) {
                 continue;
             }
-            // UB coords：x,y,z,batch 分别在第 0/1/2/3 列，偏移 (s - firstStart)*4
             int32_t bx = coordsUb.GetValue((int64_t)(s - firstStart) * 4 + 0);
             int32_t by = coordsUb.GetValue((int64_t)(s - firstStart) * 4 + 1);
             int32_t bz = coordsUb.GetValue((int64_t)(s - firstStart) * 4 + 2);
             int32_t batch = coordsUb.GetValue((int64_t)(s - firstStart) * 4 + 3);
-            if (bx < 0 || bx >= (int32_t)t_->gridW) continue;
-            if (by < 0 || by >= (int32_t)t_->gridH) continue;
-            if (bz < 0 || bz >= (int32_t)t_->gridD) continue;
-            if (batch < 0 || batch >= (int32_t)t_->gridB) continue;
-            {
-                uint64_t outOff = ((uint64_t)batch * t_->gridD + (uint64_t)bz) * t_->gridH + (uint64_t)by;
-                outOff = (outOff * t_->gridW + (uint64_t)bx) * t_->numChannels;
-                AscendC::LocalTensor<float> cur = (bufIdx == 0) ? acc : acc1;
-                AscendC::Duplicate<float>(cur, 0.0f, (int32_t)C);
-                for (int32_t r = 0; r < ln; r++) {
-                    AscendC::Add(cur, cur, chunk[(int64_t)(coff + r) * C], (int32_t)C);
-                }
-                AscendC::PipeBarrier<PIPE_V>();
-                if (pendingWrite) {
-                    AscendC::PipeBarrier<PIPE_MTE3>();
-                }
-                AscendC::DataCopy(outGm_[outOff], cur, (int32_t)C);
-                pendingWrite = true;
-                bufIdx ^= 1;
+            if (!CoordInGrid(bx, by, bz, batch, t_)) continue;
+
+            uint64_t outOff = CoordOffset(bx, by, bz, batch, t_);
+
+            AscendC::LocalTensor<float> cur = (bufIdx == 0) ? acc : acc1;
+            AscendC::Duplicate<float>(cur, 0.0f, (int32_t)C);
+            for (int32_t r = 0; r < ln; r++) {
+                AscendC::Add(cur, cur, chunk[(int64_t)(coff + r) * C], (int32_t)C);
             }
+            AscendC::PipeBarrier<PIPE_V>();
+            if (pendingWrite) {
+                AscendC::PipeBarrier<PIPE_MTE3>();
+            }
+            AscendC::DataCopy(outGm_[outOff], cur, (int32_t)C);
+            pendingWrite = true;
+            bufIdx ^= 1;
             coff += ln;
         }
         if (pendingWrite) {

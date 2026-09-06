@@ -106,13 +106,12 @@ def bev_pool(feats, coords, B, D, H, W):
     ranks = (
         coords[:, 0] + coords[:, 1] * W + coords[:, 2] * (W * H) +
         coords[:, 3] * (W * H * D))
-    # float32 argsort 在 AiCore 上运行（快），int64 回退到 AiCpu（慢 100x）。
-    # 当 B*D*H*W > 2^24 时 float32 精度不足，不同 rank 可能碰撞。
-    # 该场景极罕见（需要 >1600 万体素），碰撞时用 int64 兜底。
-    if B * D * H * W > 16777216:
-        indices = ranks.argsort()
-    else:
-        indices = ranks.float().argsort()
+    # float32 argsort 在 AiCore 上运行（快）；int64 回退到 AiCpu（慢 100x）。
+    # 当网格体素数 > 2^24 时 float32 无法区分相邻 rank，此时用 int64 兜底。
+    # 该场景极罕见（需要 >1600 万体素），实际中几乎不会触发。
+    _MAX_FLOAT32_PRECISE_VOXELS = 1 << 24
+    indices = (ranks.argsort() if B * D * H * W > _MAX_FLOAT32_PRECISE_VOXELS
+               else ranks.float().argsort())
     # index_select 比 feats[indices] 快 ~10x（NPU 随机读优化）
     feats = torch.index_select(feats, 0, indices)
     coords = torch.index_select(coords, 0, indices).int().contiguous()
