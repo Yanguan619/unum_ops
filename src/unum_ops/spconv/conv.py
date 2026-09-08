@@ -1,5 +1,6 @@
 import hashlib
 import itertools
+import os
 
 import torch
 import torch.nn as nn
@@ -7,6 +8,15 @@ import numpy as np
 from typing import Optional, Tuple, Union
 
 from .sparse_modules import SparseConvTensor, SparseModule
+from . import ascendc
+
+# AscendC 内核默认关闭（标量实现慢于 NPU einsum），显式开启用环境变量
+_USE_ASCENDC = os.environ.get("UNUM_SPCONV_USE_ASCENDC", "").strip().lower() \
+    in ("1", "true", "yes", "on")
+
+# 邻居查找稠密网格上限（int64 条目数）：超过后回退到 sort+searchsorted。
+# 8M 条目 = 64MB，覆盖 BEVFusion 常用空间 (200,200,16)=640K / SECOND (100,100,8)=80K。
+_GRID_LOOKUP_MAX_ENTRIES = 8 * 1024 * 1024
 
 
 class SparseConvolution(SparseModule):
@@ -113,24 +123,34 @@ class SparseConvolution(SparseModule):
         w = self.weight.reshape(self.out_channels, self.in_channels, K)
         return w.permute(2, 1, 0).contiguous()
 
+    @property
+    def _wT2d(self) -> torch.Tensor:
+        """权重重排为 2D (K*C_in, C_out)，供 2D GEMM 聚合使用。
+
+        _wT 为 (K, C_in, C_out) 连续张量，按行展平 (k, i) → (K*C_in) 后
+        第 k*C_in+i 行正是 wT[k, i, :]，与 all_feats.reshape(N, K*C_in)
+        的列顺序完全对应。reshape 是零拷贝 view。
+        """
+        K = self._offsets_t.shape[0]
+        return self._wT.reshape(K * self.in_channels, self.out_channels)
+
     # ------------------------------------------------------------------
     # 邻居表构建（向量化，无 Python 逐点循环，全程留在输入设备）
     # ------------------------------------------------------------------
 
     def _encode(self, indices: torch.Tensor, spatial_shape) -> torch.Tensor:
-        """将坐标 (N, 1+ndim) [batch, spatial...] 编码为单一 int64 key（空间内唯一）。
+        """将坐标 (N, 1+ndim) [batch, spatial...] 编码为单一 int64 key。
 
-        spatial_shape 按 [D, H, W]（z,y,x）顺序给出，而坐标列按 [x, y, z] 顺序，
+        spatial_shape 按 [x, y, z] 顺序给出，坐标列按 [x, y, z] 顺序，
         因此列乘数需从最后一列（z）向第一列（x）累乘空间尺寸。
-        所有计算在 indices 所在设备完成。
         """
         ndim = self.ndim
-        rev = [int(spatial_shape[i]) for i in range(ndim - 1, -1, -1)]
+        sp = [int(spatial_shape[i]) for i in range(ndim)]
         strides = [1] * (ndim + 1)
         acc = 1
         for j in range(ndim, 0, -1):
             strides[j] = acc
-            acc *= rev[j - 1]
+            acc *= sp[j - 1]
         strides[0] = acc
         # 构造 strides 张量，放在 indices 同设备
         strides_t = torch.tensor(strides, dtype=torch.int64, device=indices.device)
@@ -140,18 +160,60 @@ class SparseConvolution(SparseModule):
             keys = keys + inds[:, d + 1] * strides_t[d + 1]
         return keys
 
+    def _lookup_grid(self, in_keys: torch.Tensor, cand_keys: torch.Tensor,
+                     cand_valid: torch.Tensor, max_key: int) -> torch.Tensor:
+        """稠密网格 O(1) 查找：in_keys 与 cand_keys 已在同一 key 空间。
+
+        max_key: 网格分配大小下界（>= batch_size*sp_total）。
+        NPU 上 index_put_ + gather 远快于 sort + searchsorted（~5x）。
+        空间过大（> _GRID_LOOKUP_MAX_ENTRIES）时返回 None 由调用方回退。
+        """
+        N_in = in_keys.numel()
+        max_key = max(max_key, int(in_keys.max().item()) + 1)
+        grid_size = max_key
+        if grid_size <= _GRID_LOOKUP_MAX_ENTRIES:
+            device = in_keys.device
+            grid = torch.full((grid_size,), -1, dtype=torch.int64, device=device)
+            ar = torch.arange(N_in, dtype=torch.int64, device=device)
+            grid.index_put_([in_keys], ar)
+            nb = grid[cand_keys.reshape(-1)].reshape(cand_keys.shape)
+            return torch.where(cand_valid, nb, torch.full_like(nb, -1))
+        return None
+
     def _lookup(self, in_indices: torch.Tensor, spatial_shape,
                 cand_keys: torch.Tensor, cand_valid: torch.Tensor) -> torch.Tensor:
         """批量查找候选坐标对应的输入行索引；未命中置 -1。
-        全程在 cand_keys 所在设备完成。"""
+        全程在 cand_keys 所在设备完成。
+
+        快速路径（稠密网格 O(1) 查找）：
+          构建 spatial_shape 大小的稠密索引表，将坐标 key 直映射到行索引。
+          NPU 上 index_put_ + gather 远快于 sort + searchsorted（~5x）。
+
+        回退路径（sort + searchsorted）：
+          空间过大（> _GRID_LOOKUP_MAX_ENTRIES）时使用，避免大张量内存申请。
+        """
         in_keys = self._encode(in_indices, spatial_shape)
         N_in = in_keys.numel()
         if N_in == 0:
             return torch.full_like(cand_keys, -1)
-        in_keys_sorted, order = torch.sort(in_keys)
-        pos = torch.searchsorted(in_keys_sorted, cand_keys)
+
+        ndim = self.ndim
+        sp_total = 1
+        for i in range(ndim):
+            sp_total *= int(spatial_shape[i])
+        batch_size = int(in_indices[:, 0].max().item()) + 1
+        grid_size = batch_size * sp_total
+
+        if grid_size <= _GRID_LOOKUP_MAX_ENTRIES:
+            nb = self._lookup_grid(in_keys, cand_keys, cand_valid, grid_size)
+            if nb is not None:
+                return nb
+
+        # 回退：sort + searchsorted
+        in_keys_sorted, order = torch.sort(in_keys.double())
+        pos = torch.searchsorted(in_keys_sorted, cand_keys.double())
         pos = pos.clamp(0, N_in - 1)
-        match = (in_keys_sorted[pos] == cand_keys) & cand_valid
+        match = (in_keys_sorted[pos] == cand_keys.double()) & cand_valid
         return torch.where(match, order[pos], torch.full_like(pos, -1))
 
     def _build_neighbor_idx(self, in_indices: torch.Tensor, out_coords: torch.Tensor,
@@ -163,6 +225,10 @@ class SparseConvolution(SparseModule):
         SubM 语义下（stride=1, padding=0, dilation=1）退化为 q + k。
         返回 (N_out, K) 邻居行索引，-1 表示邻居不存在。
         全程在 out_coords 所在设备完成（不再强制 .cpu()）。
+
+        快速路径（SubM / in_indices == out_coords 同数据）：
+          候选 key = in_key + offs_key - padding_key，
+          避免 (N*K, ndim) 候选坐标构造 + 二次编码（~6ms @ 5 万体素）。
         """
         ndim = self.ndim
         device = out_coords.device
@@ -170,7 +236,7 @@ class SparseConvolution(SparseModule):
         K = offs.shape[0]
         N_out = out_coords.shape[0]
         sp_col = torch.tensor(
-            [int(spatial_shape[i]) for i in range(ndim - 1, -1, -1)],
+            [int(spatial_shape[i]) for i in range(ndim)],
             dtype=torch.int64, device=device,
         )
         pad = torch.tensor([int(p) for p in padding[:ndim]], dtype=torch.int64, device=device)
@@ -182,6 +248,35 @@ class SparseConvolution(SparseModule):
 
         oc = out_coords
         cand_sp = oc[:, None, 1:] * st + offs[None] * dil - pad   # (N_out, K, ndim) 列序 [x,y,z]
+        # SubM 快速路径：in_indices 与 out_coords 同一数据（stride=1 下采样不变）
+        if (in_indices.data_ptr() == out_coords.data_ptr()
+                and all(int(s) == 1 for s in stride[:ndim])):
+            in_keys = self._encode(in_indices, spatial_shape)          # (N,)
+            # 偏移量在 key 空间：offs*strides[1:] - padding*strides[1:]
+            sp_strides = [1] * (ndim + 1)
+            acc = 1
+            for j in range(ndim, 0, -1):
+                sp_strides[j] = acc
+                acc *= int(spatial_shape[j - 1])
+            sp_strides[0] = acc
+            sp_total = acc
+            offs_key = (offs * dil * torch.tensor(
+                sp_strides[1:], dtype=torch.int64, device=device)).sum(-1)
+            pad_key = (pad * torch.tensor(sp_strides[1:], dtype=torch.int64, device=device)).sum(-1)
+            cand_keys = in_keys[:, None] + (offs_key - pad_key)[None, :]   # (N, K)
+
+            # 边界：核窗口内的邻居落在 [0, sp) 内才算有效
+            in_range = (cand_sp >= 0) & (cand_sp < sp_col)
+            valid = in_range.all(-1)
+            cand_keys = torch.where(valid, cand_keys, torch.zeros_like(cand_keys))
+            sp_total = sp_strides[0]
+            batch_size = int(in_indices[:, 0].max().item()) + 1
+            nb = self._lookup_grid(in_keys, cand_keys, valid, batch_size * sp_total)
+            if nb is not None:
+                return nb
+            # 网格过大时回退到 sort + searchsorted
+            return self._lookup(in_indices, spatial_shape, cand_keys, valid)
+
         in_range = (cand_sp >= 0) & (cand_sp < sp_col)
         valid = in_range.all(-1)
         batch = oc[:, None, 0:1].expand(N_out, K, 1)
@@ -205,7 +300,7 @@ class SparseConvolution(SparseModule):
         K = offs.shape[0]
         N_out = out_coords.shape[0]
         sp_col = torch.tensor(
-            [int(spatial_shape[i]) for i in range(ndim - 1, -1, -1)],
+            [int(spatial_shape[i]) for i in range(ndim)],
             dtype=torch.int64, device=device,
         )
         pad = torch.tensor([int(p) for p in padding[:ndim]], dtype=torch.int64, device=device)
@@ -235,6 +330,11 @@ class SparseConvolution(SparseModule):
         """out[n] = bias + sum_k wT[k] @ features[neighbor_idx[n,k]]（邻居缺失贡献为 0）
 
         neighbor_idx 必须与 features 同设备（由上层 _neighbor_cached 保证）。
+
+        设备策略：
+          - NPU 上且 AscendC 扩展可加载时，特征聚合（gather 后 GEMM）卸载到
+            自定义 AscendC 内核 ``unum.spconv_gemm``（含 autograd 反向）。
+          - 其余情况回退到 2D GEMM（原 einsum 在 NPU 上慢 6x，改用 (N, K*C_in) @ (K*C_in, C_out)）。
         """
         N, K = neighbor_idx.shape
         C_in = features.shape[1]
@@ -243,19 +343,30 @@ class SparseConvolution(SparseModule):
             return features.new_zeros(0, C_out)
         wT = self._wT  # (K, C_in, C_out)
 
-        # 单次大 GEMM 代替 K 次小 addmm 循环
         # 1. 展平邻居索引，一次性 gather 所有邻居特征
         nb_flat = neighbor_idx.reshape(-1)               # (N*K,)
         valid = nb_flat >= 0                              # (N*K,)
         nb_safe = nb_flat.clamp(min=0)                   # 无效位置暂时指向第 0 行
-        all_feats = features[nb_safe]                    # (N*K, C_in)
+        all_feats = torch.index_select(features, 0, nb_safe)  # (N*K, C_in)
         # 无效邻居置零（不影响累加）
         all_feats = all_feats * valid.unsqueeze(-1).to(dtype=features.dtype)
         all_feats = all_feats.reshape(N, K, C_in)       # (N, K, C_in)
 
-        # 2. 批量矩阵乘: (N, K, C_in) @ (K, C_in, C_out) → (N, K, C_out) → (N, C_out)
-        # 用 einsum 代替 bmm（bmm 要求 batch 维一致，不支持广播）
-        out = torch.einsum('nki,kio->no', all_feats, wT)  # (N, C_out)
+        # 2. AscendC 加速路径（仅 NPU + 扩展可加载 + 显式启用时）
+        # 注意：当前 AscendC 内核为标量实现（正确但慢），
+        # 默认走 2D GEMM；设置环境变量 UNUM_SPCONV_USE_ASCENDC=1 可启用内核。
+        if (features.device.type == 'npu' and _USE_ASCENDC
+                and ascendc.available()):
+            feats_l = all_feats.permute(1, 0, 2).contiguous()  # (K, N, C_in)
+            w_l = wT.contiguous()
+            if self.bias is not None:
+                b_l = self.bias
+            else:
+                b_l = torch.zeros(C_out, dtype=features.dtype, device=features.device)
+            return ascendc.spconv_gemm(feats_l, w_l, b_l)
+
+        # 3. 回退路径：2D GEMM（NPU 上 3D einsum 慢 6x，展平为 (N, K*C_in) @ (K*C_in, C_out)）
+        out = all_feats.reshape(N, K * C_in) @ self._wT2d  # (N, C_out)
 
         if self.bias is not None:
             out.add_(self.bias)
