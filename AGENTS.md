@@ -20,8 +20,20 @@ cd csrc/ascend/voxelization && rm -rf build_out /data/kernel_meta && bash build.
 # voxelization benchmark
 python -m pytest benchmark/bench_voxelization.py -v
 
+# Triton-free 基准装饰器（无 triton 环境用）
+# from bench_utils import perf_report, Benchmark, do_bench   # 替代 from triton.testing import ...
+# Benchmark 兼容 triton API: styles/ylabel/x_log/y_log/args(dict或tuple)
+# do_bench(fn, warmup=25, rep=100, quantiles=[0.5,0.2,0.8]) 与 triton 相同 ms 时间预算语义
+# 结果自动存 benchmark/output/*.txt，show_plots=True 时存 .png
+
 # spconv tests
 python -m pytest test/test_spconv.py -q
+
+# spconv AscendC 内核测试（NPU）
+python -m pytest test/test_spconv_ascendc.py -q
+
+# spconv AscendC: build OPP + install + op_extension
+cd csrc/ascend/spconv && bash rebuild_install.sh && cd /workspace/unum_ops
 
 # stability test
 python -m pytest test/test_stability.py -v
@@ -53,6 +65,15 @@ python -m pytest test/test_spconv.py test/test_bev_pool.py test/test_voxelizatio
 - [x] **voxelization benchmark 补参数**: 不同 voxel_size/PCR 组合
 - [x] **test_bev_pool.py 去重**: 删除重复的 `test_all_oob_points`
 - [x] **voxelization 修复回归测试**: `test_small_max_voxels_clean_error` + `test_large_grid_clean_error` 断言干净报错而非崩溃
+- [x] **spconv AscendC 算子**: `csrc/ascend/spconv` + `src/unum_ops/spconv/ascendc.py`，drop-in 接入 `_gather`
+  - 内核只做 gather 后 GEMM `out = feats @ weight + bias`
+  - 310P 关键修复：shape 参数（K/N/Cin/Cout/blockNum）通过额外 `params` 输入在运行时从 GM 读取，
+    规避 310P 编译期烘焙 tiling 的 stale 问题（P4）；输出用 MTE3 DataCopy 写，规避标量 GM 写缓冲不可见（P3）
+  - **tile 间 PIPE_ALL 同步**：修复多 tile 场景下标量 GetValue 与下一 tile DataCopy 的竞争
+  - `torch_npu.npu.set_compile_mode(jit_compile=False)` 必须在使用前调用（AGENTS.md 全局约定）
+  - **性能**: 向量化路径（Axpy + DataCopy + 多核 tile）比 NPU einsum 慢 3~10x（einsum 用 Cube 单元），
+    但比纯标量路径快 10x。默认走 einsum；设置 `UNUM_SPCONV_USE_ASCENDC=1` 启用内核。
+  - **向量化路径不可用原因（已修复）**：tile 间缺少全管线同步导致标量 GetValue 与 DataCopy 竞争
 
 ## Known Bugs (已修复)
 
@@ -72,7 +93,7 @@ python -m pytest test/test_spconv.py test/test_bev_pool.py test/test_voxelizatio
 
 全部完成。项目当前状态：
 
-- 3 个 AscendC 算子：bev_pool ✅ / voxelization ✅ / spconv ✅
+- 3 个 AscendC 算子：bev_pool ✅ / voxelization ✅ / spconv ✅（spconv 为 gather+GEMM 内核 + params 运行时 shape）
 - 91 个测试全部通过，1500 次长稳压测 0 错误
 - 多 vendor 独立部署，统一 dlopen 加载，无冲突
 - pip install 时自动编译 AscendC 扩展 .so

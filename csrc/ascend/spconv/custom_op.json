@@ -1,0 +1,61 @@
+[
+    {
+        "op": "SpconvGemm",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "feats",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float16"
+                ]
+            },
+            {
+                "name": "weight",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float16"
+                ]
+            },
+            {
+                "name": "bias",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float32"
+                ]
+            },
+            {
+                "name": "params",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "out",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float32"
+                ]
+            }
+        ],
+        "attr": []
+    }
+]

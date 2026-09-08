@@ -67,17 +67,17 @@ from spconv.utils import VoxelGeneratorV2
 def make_tensor(N, C, spatial_shape, batch_size=1, seed=0):
     """3D 随机 SparseConvTensor（与 spconv/test_conv.py make_tensor 一致）
 
-    indices: (N, 4) = [batch, x, y, z]，x∈[0,W), y∈[0,H), z∈[0,D)
-    spatial_shape: (D, H, W)
+    indices: (N, 4) = [batch, x, y, z]
+    spatial_shape: (x_dim, y_dim, z_dim)，x∈[0,x_dim), y∈[0,y_dim), z∈[0,z_dim)
     """
     g = torch.Generator()
     g.manual_seed(seed)
-    D, H, W = spatial_shape[:3]
+    x_dim, y_dim, z_dim = spatial_shape[:3]
     coords = set()
     while len(coords) < N:
-        xs = torch.randint(0, W, (N * 4,), generator=g).tolist()
-        ys = torch.randint(0, H, (N * 4,), generator=g).tolist()
-        zs = torch.randint(0, D, (N * 4,), generator=g).tolist()
+        xs = torch.randint(0, x_dim, (N * 4,), generator=g).tolist()
+        ys = torch.randint(0, y_dim, (N * 4,), generator=g).tolist()
+        zs = torch.randint(0, z_dim, (N * 4,), generator=g).tolist()
         for i in range(len(xs)):
             coords.add((0, xs[i], ys[i], zs[i]))
             if len(coords) >= N:

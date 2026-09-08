@@ -56,13 +56,6 @@ class SparseConvTensor:
         return out
 
     def dense(self, channels_first: bool = True) -> torch.Tensor:
-        """将稀疏张量转为密集张量
-
-        Args:
-            channels_first: True -> (B, C, *spatial), False -> (B, *spatial, C)
-        Returns:
-            密集张量
-        """
         spatial = self.spatial_shape[:self.ndim]
         N, C = self.features.shape
         B = self.batch_size
@@ -75,17 +68,48 @@ class SparseConvTensor:
                                 device=self.features.device)
 
         indices = self.indices.long()
-        for i in range(N):
-            b = indices[i, 0].item()
-            sp = [indices[i, d + 1].item() for d in range(self.ndim)]
-            if any(sp[d] >= spatial[d] or sp[d] < 0 for d in range(self.ndim)):
-                continue
-            if b < 0 or b >= B:
-                continue
-            if channels_first:
-                dense[(b, slice(None), *sp)] = self.features[i]
+        valid = (indices[:, 0] >= 0) & (indices[:, 0] < B)
+        for d in range(self.ndim):
+            valid &= (indices[:, d + 1] >= 0) & (indices[:, d + 1] < spatial[d])
+        if not valid.any():
+            return dense
+
+        valid_idx = indices[valid]
+        valid_feat = self.features[valid]
+
+        if channels_first:
+            b = valid_idx[:, 0]
+            x = valid_idx[:, 1]
+            y = valid_idx[:, 2]
+            if self.ndim == 3:
+                z = valid_idx[:, 3]
+                # dense is (B, C, D, H, W); flat index of (b, c, x, y, z):
+                # b*C*D*H*W + c*D*H*W + x*H*W + y*W + z
+                base = (b * C * spatial[0] * spatial[1] * spatial[2] +
+                        x * spatial[1] * spatial[2] +
+                        y * spatial[2] + z)
+                c_offset = torch.arange(
+                    C, device=valid_feat.device) * spatial[0] * spatial[1] * spatial[2]
             else:
-                dense[(b, *sp, slice(None))] = self.features[i]
+                # dense is (B, C, H, W); flat index of (b, c, x, y):
+                # b*C*H*W + c*H*W + x*W + y
+                base = (b * C * spatial[0] * spatial[1] +
+                        x * spatial[1] + y)
+                c_offset = torch.arange(
+                    C, device=valid_feat.device) * spatial[0] * spatial[1]
+            flat_idx = base.unsqueeze(1) + c_offset.unsqueeze(0)
+            dense.view(-1).scatter_add_(0, flat_idx.reshape(-1), valid_feat.reshape(-1))
+        else:
+            if self.ndim == 3:
+                x, y, z = valid_idx[:, 1], valid_idx[:, 2], valid_idx[:, 3]
+                flat = (valid_idx[:, 0] * spatial[0] * spatial[1] * spatial[2] +
+                        x * spatial[1] * spatial[2] + y * spatial[2] + z)
+            else:
+                x, y = valid_idx[:, 1], valid_idx[:, 2]
+                flat = (valid_idx[:, 0] * spatial[0] * spatial[1] +
+                        x * spatial[1] + y)
+            flat = flat.unsqueeze(1).expand(-1, C)
+            dense.view(-1, C).scatter_add_(0, flat, valid_feat)
 
         return dense
 

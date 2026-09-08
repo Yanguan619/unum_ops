@@ -30,12 +30,13 @@ from spconv.sparse_modules import SparseConvTensor  # noqa: E402
 def make_tensor(n_voxels, n_channels, spatial_shape, device='cpu'):
     """生成随机 SparseConvTensor，4 列 indices [batch, x, y, z]
 
+    spatial_shape: (x_dim, y_dim, z_dim)
     注意：NPU 上直接调 torch.randn(device='npu') 可能触发
     StatelessRandomNormalV2 算子异常，因此统一在 CPU 生成随机数再 .to(device)。
     """
-    D, H, W = spatial_shape
+    x_dim, y_dim, z_dim = spatial_shape
     # 坐标在 CPU 生成
-    coords = torch.rand(n_voxels, 3) * torch.tensor([W, H, D], dtype=torch.float)
+    coords = torch.rand(n_voxels, 3) * torch.tensor([x_dim, y_dim, z_dim], dtype=torch.float)
     coords = coords.int()
     batch = torch.randint(0, 2, (n_voxels, 1))
     indices = torch.cat([batch, coords], dim=1).long()
