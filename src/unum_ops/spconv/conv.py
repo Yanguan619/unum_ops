@@ -10,7 +10,7 @@ from typing import Optional, Tuple, Union
 from .sparse_modules import SparseConvTensor, SparseModule
 from . import ascendc
 
-# AscendC 内核默认关闭（标量实现慢于 NPU einsum），显式开启用环境变量
+# AscendC 内核默认关闭（标量实现慢于 torch 2D GEMM），显式开启用环境变量
 _USE_ASCENDC = os.environ.get("UNUM_SPCONV_USE_ASCENDC", "").strip().lower() \
     in ("1", "true", "yes", "on")
 
@@ -211,7 +211,14 @@ class SparseConvolution(SparseModule):
 
         # 回退：sort + searchsorted
         in_keys_sorted, order = torch.sort(in_keys.double())
-        pos = torch.searchsorted(in_keys_sorted, cand_keys.double())
+        if torch.jit.is_tracing():
+            # ONNX opset 14/17 不支持 searchsorted（18+ 才有）。
+            # 用广播比较等价实现：pos = 排序序列中 <= cand_key 的元素个数（左插入点）。
+            cand_flat = cand_keys.double().reshape(-1)
+            pos = (in_keys_sorted.unsqueeze(0) <= cand_flat.unsqueeze(1)).sum(
+                dim=1).reshape(cand_keys.shape)
+        else:
+            pos = torch.searchsorted(in_keys_sorted, cand_keys.double())
         pos = pos.clamp(0, N_in - 1)
         match = (in_keys_sorted[pos] == cand_keys.double()) & cand_valid
         return torch.where(match, order[pos], torch.full_like(pos, -1))
@@ -493,7 +500,7 @@ class SparseConv3d(SparseConvolution):
             out_i = self._downsample_coords(in_c)
             keep = torch.ones(out_i.shape[0], dtype=torch.bool, device=device)
             for d in range(self.ndim):
-                keep &= (out_i[:, d + 1] >= 0) & (out_i[:, d + 1] < out_shape[d])
+                keep = keep & (out_i[:, d + 1] >= 0) & (out_i[:, d + 1] < out_shape[d])
             out_i = out_i[keep]
             out_i = torch.unique(out_i, dim=0)
             nb = self._build_neighbor_idx(
