@@ -212,11 +212,17 @@ class SparseConvolution(SparseModule):
         # 回退：sort + searchsorted
         in_keys_sorted, order = torch.sort(in_keys.double())
         if torch.jit.is_tracing():
-            # ONNX opset 14/17 不支持 searchsorted（18+ 才有）。
-            # 用广播比较等价实现：pos = 排序序列中 <= cand_key 的元素个数（左插入点）。
-            cand_flat = cand_keys.double().reshape(-1)
-            pos = (in_keys_sorted.unsqueeze(0) <= cand_flat.unsqueeze(1)).sum(
-                dim=1).reshape(cand_keys.shape)
+            # ONNX 不支持 searchsorted。用二分查找 O(N*K*logN) 内存友好。
+            lo = torch.zeros_like(cand_keys, dtype=torch.long)
+            hi = torch.full_like(cand_keys, N_in, dtype=torch.long)
+            cd = cand_keys.double()
+            for _ in range(22):  # 2^22 = 4M, 覆盖 N 到 4M
+                mid = (lo + hi) // 2
+                mid_val = in_keys_sorted[mid.clamp(0, N_in - 1)]
+                is_lo = mid_val <= cd
+                lo = torch.where(is_lo, mid, lo)
+                hi = torch.where(is_lo, hi, mid)
+            pos = lo
         else:
             pos = torch.searchsorted(in_keys_sorted, cand_keys.double())
         pos = pos.clamp(0, N_in - 1)
@@ -360,16 +366,16 @@ class SparseConvolution(SparseModule):
         all_feats = all_feats.reshape(N, K, C_in)       # (N, K, C_in)
 
         # 2. AscendC 加速路径（仅 NPU + 扩展可加载 + 显式启用时）
-        # 注意：当前 AscendC 内核为标量实现（正确但慢），
-        # 默认走 2D GEMM；设置环境变量 UNUM_SPCONV_USE_ASCENDC=1 可启用内核。
+        # Cube 内核：fp16 (N, K*C_in) @ fp16 (K*C_in, C_out) → fp32 (N, C_out)。
+        # 默认走 torch 2D GEMM；设置环境变量 UNUM_SPCONV_USE_ASCENDC=1 启用内核。
         if (features.device.type == 'npu' and _USE_ASCENDC
                 and ascendc.available()):
-            feats_l = all_feats.permute(1, 0, 2).contiguous()  # (K, N, C_in)
-            w_l = wT.contiguous()
+            feats_l = all_feats.reshape(N, K * C_in).to(torch.float16)
+            w_l = self._wT2d.to(torch.float16)
             if self.bias is not None:
-                b_l = self.bias
+                b_l = self.bias.to(torch.float32)
             else:
-                b_l = torch.zeros(C_out, dtype=features.dtype, device=features.device)
+                b_l = torch.zeros(C_out, dtype=torch.float32, device=features.device)
             return ascendc.spconv_gemm(feats_l, w_l, b_l)
 
         # 3. 回退路径：2D GEMM（NPU 上 3D einsum 慢 6x，展平为 (N, K*C_in) @ (K*C_in, C_out)）
