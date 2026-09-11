@@ -1,26 +1,28 @@
-"""Ascend 310P BevPool 性能基准测试。
+"""Ascend 310P BevPool 性能基准测试（Triton-free + tabulate 输出）。
 
 对比 AscendC 算子与纯 torch scatter_add 参考实现耗时。
+torch / ascendc 作为表头列，num_points 或配置作为行。
 
 运行方式:
+    python benchmark/bench_bev_pool.py
     python -m pytest benchmark/bench_bev_pool.py -v
 """
 import os
-import time
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
 
 import numpy as np
-import pytest
 import torch
 import torch_npu
 
+from bench_utils import Benchmark, do_bench, perf_report
 from unum_ops.bev_pool import bev_pool, bev_pool_torch
 
 torch.npu.set_compile_mode(jit_compile=False)
-torch.npu.set_device(0)
+torch.npu.set_device(int(os.environ.get("UNUM_BENCH_DEVICE", "0")))
 
-WARMUP = 5
-REPEAT = 20
-_RESULTS_FILE = os.path.join(os.path.dirname(__file__), "output", "bev_pool_results.txt")
 B, D, H, W, C = 1, 8, 100, 100, 80
 _N_POINTS = [2000, 8000, 32000, 128000, 512000]
 # 维度扫描：不同 C / 网格 / batch 组合
@@ -33,76 +35,72 @@ _DIM_SWEEPS = [
     ("D=16",    1, 16, 100, 100, 80),
     ("多batch", 4, 8, 100, 100, 80),
 ]
+_QUANTILES = [0.5, 0.2, 0.8]
 
 
-def _time_ms(fn, warmup=WARMUP, repeat=REPEAT):
-    for _ in range(warmup):
-        fn()
-    torch.npu.synchronize()
-    times = []
-    for _ in range(repeat):
-        t0 = time.perf_counter()
-        fn()
-        torch.npu.synchronize()
-        times.append((time.perf_counter() - t0) * 1000)
-    return np.mean(times), np.std(times)
+def _make_inputs(N, b, d, h, w, c, seed):
+    g = torch.Generator().manual_seed(seed)
+    feats = torch.randn(N, c, generator=g, dtype=torch.float32)
+    coords = torch.stack([
+        torch.randint(0, w, (N,), generator=g, dtype=torch.int64),
+        torch.randint(0, h, (N,), generator=g, dtype=torch.int64),
+        torch.randint(0, d, (N,), generator=g, dtype=torch.int64),
+        torch.randint(0, b, (N,), generator=g, dtype=torch.int64),
+    ], dim=1)
+    return feats, coords
+
+
+def _bench(feats, coords, b, d, h, w):
+    torch_ms = do_bench(lambda: bev_pool_torch(feats, coords, b, d, h, w),
+                        quantiles=_QUANTILES)
+    pts = feats.npu().contiguous()
+    cs = coords.npu().contiguous()
+    asc_ms = do_bench(lambda: bev_pool(pts, cs, b, d, h, w),
+                      grad_to_none=[pts, cs], quantiles=_QUANTILES)
+    return {"torch(ms)": torch_ms, "ascendc(ms)": asc_ms}
+
+
+@perf_report(
+    Benchmark(
+        x_names=["num_points"],
+        x_vals=_N_POINTS,
+        x_log=True,
+        plot_name="bev_pool",
+        ylabel="Latency (ms)",
+    ),
+)
+def bench_npoints(num_points):
+    feats, coords = _make_inputs(num_points, B, D, H, W, C, seed=7)
+    return _bench(feats, coords, B, D, H, W)
+
+
+@perf_report(
+    Benchmark(
+        x_names=["config"],
+        x_vals=[label for label, *_ in _DIM_SWEEPS],
+        plot_name="bev_pool_dim_sweep",
+        ylabel="Latency (ms)",
+    ),
+)
+def bench_dimsweep(config):
+    N = 32000
+    b, d, h, w, c = next(dims for label, *dims in _DIM_SWEEPS if label == config)
+    feats, coords = _make_inputs(N, b, d, h, w, c, seed=11)
+    return _bench(feats, coords, b, d, h, w)
+
+
+def _run_all():
+    bench_npoints.run(print_data=True, show_plots=True)
+    bench_dimsweep.run(print_data=True, show_plots=True)
 
 
 def test_bev_pool_bench():
-    """BevPool 算子性能基准（AscendC vs torch scatter_add）。"""
-    rng = torch.Generator()
-    rng.manual_seed(7)
-    results = []
-
-    print(f"\n{'num_points':>10} {'torch_ms':>12} {'ascendc_ms':>12}")
-    print("-" * 40)
-
-    for N in _N_POINTS:
-        feats = torch.randn(N, C, generator=rng, dtype=torch.float32)
-        coords = torch.stack([
-            torch.randint(0, W, (N,), generator=rng, dtype=torch.int64),
-            torch.randint(0, H, (N,), generator=rng, dtype=torch.int64),
-            torch.randint(0, D, (N,), generator=rng, dtype=torch.int64),
-            torch.randint(0, B, (N,), generator=rng, dtype=torch.int64),
-        ], dim=1)
-        pts = feats.npu().contiguous()
-        cs = coords.npu().contiguous()
-
-        asc_mean, asc_std = _time_ms(lambda: bev_pool(pts, cs, B, D, H, W))
-        torch_mean, torch_std = _time_ms(lambda: bev_pool_torch(feats, coords, B, D, H, W))
-
-        results.append((N, asc_mean, asc_std, torch_mean, torch_std))
-        print(f"{N:>10} {torch_mean:>10.3f} ±{torch_std:.3f}  {asc_mean:>10.3f} ±{asc_std:.3f}")
-
-    os.makedirs(os.path.dirname(_RESULTS_FILE), exist_ok=True)
-    with open(_RESULTS_FILE, "w") as f:
-        f.write(f"B={B} D={D} H={H} W={W} C={C}\n")
-        f.write(f"{'num_points':>10} {'torch_ms':>12} {'torch_std':>12} {'ascendc_ms':>12} {'ascendc_std':>12}\n")
-        for N, am, as_, tm, ts in results:
-            f.write(f"{N:>10} {tm:>12.3f} {ts:>12.3f} {am:>12.3f} {as_:>12.3f}\n")
-    print(f"\nResults saved to {_RESULTS_FILE}")
+    bench_npoints.run(print_data=True, show_plots=True)
 
 
 def test_bev_pool_bench_dim_sweep():
-    """维度扫描：不同 C/D/H/W/batch 组合下的性能。"""
-    rng = torch.Generator()
-    rng.manual_seed(11)
-    N = 32000
-    print(f"\n{'配置':<10} {'B×D×H×W×C':<22} {'ascendc_ms':>12} {'torch_ms':>12}")
-    print("-" * 56)
+    bench_dimsweep.run(print_data=True, show_plots=True)
 
-    for label, b, d, h, w, c in _DIM_SWEEPS:
-        feats = torch.randn(N, c, generator=rng, dtype=torch.float32)
-        coords = torch.stack([
-            torch.randint(0, w, (N,), generator=rng, dtype=torch.int64),
-            torch.randint(0, h, (N,), generator=rng, dtype=torch.int64),
-            torch.randint(0, d, (N,), generator=rng, dtype=torch.int64),
-            torch.randint(0, b, (N,), generator=rng, dtype=torch.int64),
-        ], dim=1)
-        pts = feats.npu().contiguous()
-        cs = coords.npu().contiguous()
 
-        asc_mean, asc_std = _time_ms(lambda: bev_pool(pts, cs, b, d, h, w))
-        torch_mean, torch_std = _time_ms(lambda: bev_pool_torch(feats, coords, b, d, h, w))
-
-        print(f"{label:<10} {b}×{d}×{h}×{w}×{c:<10} {asc_mean:>10.3f} ±{asc_std:.3f} {torch_mean:>10.3f} ±{torch_std:.3f}")
+if __name__ == "__main__":
+    _run_all()

@@ -79,6 +79,14 @@ _EXTENSIONS = [
         "require_headers": ["aclnn_voxelization.h"],
         "opp_source_dir": "csrc/ascend/voxelization",
     },
+    {
+        "name": "spconv",
+        "vendor": "spconv",
+        "src_dir": "csrc/ascend/spconv/op_extension",
+        "so_name": "libspconv_gemm_ops.so",
+        "require_headers": ["aclnn_spconv_gemm.h"],
+        "opp_source_dir": "csrc/ascend/spconv",
+    },
 ]
 
 
