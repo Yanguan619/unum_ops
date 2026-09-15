@@ -16,7 +16,11 @@ _USE_ASCENDC = os.environ.get("UNUM_SPCONV_USE_ASCENDC", "").strip().lower() \
 
 # 邻居查找稠密网格上限（int64 条目数）：超过后回退到 sort+searchsorted。
 # 8M 条目 = 64MB，覆盖 BEVFusion 常用空间 (200,200,16)=640K / SECOND (100,100,8)=80K。
-_GRID_LOOKUP_MAX_ENTRIES = 8 * 1024 * 1024
+# 注意：BEVFusion 的 SECOND 空间是 (1440,1440,41)=85M 条目，超过 8M 会回退到
+# sort+searchsorted 路径，而该路径在 NPU 上数值严重失真（SubMConv 输出 cos≈0.72）。
+# 因此上限需覆盖 BEVFusion 85M grid（256M 条目 = 2GB）。NPU 上 grid 路径
+# （index_put_ + gather）与 CPU 完全一致（cos=1.0，rel=0.03%）。
+_GRID_LOOKUP_MAX_ENTRIES = 256 * 1024 * 1024
 
 
 class SparseConvolution(SparseModule):
