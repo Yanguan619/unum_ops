@@ -5,13 +5,10 @@
 接口可用性清单 ``INTERFACES_310P`` 配合 ``detect_device()`` 联动。
 """
 
-import os
-from typing import Dict, List, Tuple
-
 # ============================================================
 # 设备自动检测
 # ============================================================
-_DEVICE_CACHE: Dict[str, str] = {}
+_DEVICE_CACHE: dict[str, str] = {}
 
 
 def detect_device() -> str:
@@ -65,11 +62,11 @@ IS_CPU = detect_device() == "cpu"
 # ============================================================
 # 延迟导入子模块
 # ============================================================
-for _mod in ("infllm_v2", "sparse_kernel_extension", "voxelization", "spconv"):
+for _mod in ("infllm_v2", "sparse_kernel_extension", "voxelization", "spconv", "pointnet2"):
     try:
         __import__(f"unum_ops.{_mod}")
-    except Exception:
-        pass
+    except ImportError:
+        print(f"unum_ops.{_mod} 导入失败")
 
 # ============================================================
 # 静态接口可用性清单（全局真相源）
@@ -81,7 +78,7 @@ for _mod in ("infllm_v2", "sparse_kernel_extension", "voxelization", "spconv"):
 #
 # 维护约定：新增接口时在此登记一行；修改依赖时同步更新 status/reason。
 # ============================================================
-INTERFACES_310P: Dict[str, Dict[str, Tuple[bool, str]]] = {
+INTERFACES_310P: dict[str, dict[str, tuple[bool, str]]] = {
     "spconv": {
         "SparseConvTensor": (True, "纯 torch"),
         "SparseModule": (True, "纯 torch"),
@@ -121,21 +118,36 @@ INTERFACES_310P: Dict[str, Dict[str, Tuple[bool, str]]] = {
         "bev_pool_torch": (True, "纯 torch scatter_add 实现"),
         "BevPoolOutput": (True, "纯 python 数据结构"),
     },
+    "pointnet2": {
+        "furthest_point_sample": (True, "纯 torch 循环；CPU eager 走 numpy 就地快路径(~8x)，trace 时回退 torch；NPU 时 CPU fallback"),
+        "furthest_point_sample_onnx": (True, "纯 torch 循环，ONNX 可导出（不包 autograd.Function）"),
+        "gather_operation": (True, "纯 torch.gather"),
+        "three_nn": (True, "纯 torch cdist+topk"),
+        "three_interpolate": (True, "纯 torch，k=3 循环"),
+        "grouping_operation": (True, "纯 torch，nsample 循环"),
+        "ball_query": (True, "纯 torch cdist+where，NPU 时 CPU fallback"),
+        "cylinder_query": (True, "纯 torch matmul+where，NPU 时 CPU fallback"),
+        "three_interpolate_onnx": (True, "纯 torch，ONNX 可导出"),
+        "grouping_operation_onnx": (True, "纯 torch，ONNX 可导出"),
+        "cylinder_query_onnx": (True, "纯 torch 全向量化，ONNX 可导出"),
+        "QueryAndGroup": (True, "纯 torch nn.Module"),
+        "GroupAll": (True, "纯 torch nn.Module"),
+        "CylinderQueryAndGroup": (True, "纯 torch nn.Module"),
+        "knn": (True, "纯 torch cdist+topk"),
+    },
 }
 
 
-def _runtimes_ok(entry: Tuple[bool, str]) -> bool:
+def _runtimes_ok(entry: tuple[bool, str]) -> bool:
     """根据当前运行时判断某接口是否可用。"""
     ok, reason = entry
     if not ok:
         return False
     # "需编译 .so" 的接口仅当 .so 存在时视为可用
-    if "需先编译" in reason:
-        return False
-    return True
+    return "需先编译" not in reason
 
 
-def list_available_interfaces() -> List[str]:
+def list_available_interfaces() -> list[str]:
     """列出当前设备上可调用的全部接口。"""
     return [
         f"{mod}.{name}"
@@ -145,7 +157,7 @@ def list_available_interfaces() -> List[str]:
     ]
 
 
-def list_unavailable_interfaces() -> List[str]:
+def list_unavailable_interfaces() -> list[str]:
     """列出当前设备上不可调用的全部接口。"""
     return [
         f"{mod}.{name}"
@@ -163,7 +175,7 @@ def is_available(module: str, name: str) -> bool:
     return _runtimes_ok(entry)
 
 
-def list_310p_interfaces() -> List[str]:
+def list_310p_interfaces() -> list[str]:
     """列出 310P 理论上可调用的全部接口名（忽略 .so 编译状态）。"""
     return [
         f"{mod}.{name}"
@@ -173,7 +185,7 @@ def list_310p_interfaces() -> List[str]:
     ]
 
 
-def list_non_310p_interfaces() -> List[str]:
+def list_non_310p_interfaces() -> list[str]:
     """列出 310P 不可调用的全部接口名。"""
     return [
         f"{mod}.{name}"
@@ -198,7 +210,7 @@ def print_310p_interfaces() -> None:
         for name, (ok, reason) in tbl.items():
             available = _runtimes_ok((ok, reason))
             tag = "可用" if available else "不可用"
-            print(f"{mod+'.'+name:<42} {tag:<6} {reason}")
+            print(f"{mod + '.' + name:<42} {tag:<6} {reason}")
 
 
 def main() -> None:
@@ -207,21 +219,21 @@ def main() -> None:
 
 
 __all__ = [
-    "infllm_v2",
-    "sparse_kernel_extension",
-    "voxelization",
-    "spconv",
     "INTERFACES_310P",
     "IS_310P",
-    "IS_NPU",
-    "IS_CUDA",
     "IS_CPU",
+    "IS_CUDA",
+    "IS_NPU",
     "detect_device",
-    "list_available_interfaces",
-    "list_unavailable_interfaces",
+    "is_310p_compatible",
     "is_available",
     "list_310p_interfaces",
+    "list_available_interfaces",
     "list_non_310p_interfaces",
-    "is_310p_compatible",
+    "list_unavailable_interfaces",
+    "pointnet2",
     "print_310p_interfaces",
+    "sparse_kernel_extension",
+    "spconv",
+    "voxelization",
 ]
