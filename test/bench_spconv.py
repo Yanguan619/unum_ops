@@ -88,7 +88,7 @@ class SubMConv3d_A(SubMConv3d):
             in_c = indices.long().to(device).contiguous()
             return self._build_neighbor_idx(
                 in_c, in_c, spatial,
-                self.kernel_size, (0, 0, 0), (1, 1, 1),
+                self.kernel_size, self.padding, self.stride,
             )
         fp = self._fingerprint(indices, ('subm', self.kernel_size, self.padding,
                                          self.stride, spatial))
@@ -110,7 +110,7 @@ class SubMConv3d_C(SubMConv3d):
             in_c = indices.long().cpu().contiguous()
             nb_cpu = self._build_neighbor_idx_cpu(
                 in_c, in_c, spatial,
-                self.kernel_size, (0, 0, 0), (1, 1, 1),
+                self.kernel_size, self.padding, self.stride,
             )
             return nb_cpu.to(device) if device.type != 'cpu' else nb_cpu
 

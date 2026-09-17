@@ -51,6 +51,16 @@ def _voxel_once(N, seed):
     return out.num_voxels
 
 
+def _voxel_check(nvox, label=""):
+    """voxelization 应返回 >0 的 num_voxels（除非输入点极少且全越界）。
+    用正整数确认 kernel 正常执行而非静默返回 0。"""
+    if nvox < 0:
+        return False, f"num_voxels < 0: {nvox}"
+    if nvox == 0:
+        return False, f"num_voxels == 0 ({label}): kernel 可能静默失败"
+    return True, ""
+
+
 @pytest.mark.parametrize("n_iter,interval", [(1000, 200)])
 def test_small_loop_stability(n_iter, interval):
     """小参数长稳：1000 次随机参数交替调用。"""
@@ -70,8 +80,9 @@ def test_small_loop_stability(n_iter, interval):
             else:
                 N = int(np.random.randint(500, 50000))
                 nvox = _voxel_once(N, seed=i * 100)
-                if nvox < 0:
-                    errors.append((i, "voxelization", f"num_voxels={nvox}"))
+                ok, msg = _voxel_check(nvox, f"small_loop i={i}")
+                if not ok:
+                    errors.append((i, "voxelization", msg))
         except Exception as e:
             errors.append((i, "unknown", str(e)[:80]))
         if i % interval == 0:
@@ -97,8 +108,9 @@ def test_large_loop_stability(n_iter, interval):
             else:
                 N = int(np.random.randint(10000, 150000))
                 nvox = _voxel_once(N, seed=i)
-                if nvox < 0:
-                    errors.append((i, "voxelization", f"num_voxels={nvox}"))
+                ok, msg = _voxel_check(nvox, f"large_loop i={i}")
+                if not ok:
+                    errors.append((i, "voxelization", msg))
         except Exception as e:
             errors.append((i, "unknown", str(e)[:80]))
         if i % interval == 0:

@@ -33,6 +33,14 @@ class SparseConvTensor:
         self._indice_dict: Dict[str, Any] = {}
 
     @property
+    def indice_dict(self):
+        return self._indice_dict
+
+    @indice_dict.setter
+    def indice_dict(self, val):
+        self._indice_dict = val
+
+    @property
     def ndim(self) -> int:
         """空间维度数（2D -> 2, 3D -> 3）"""
         return self.indices.shape[1] - 1
@@ -52,7 +60,7 @@ class SparseConvTensor:
             features, self.indices, self.spatial_shape,
             self.batch_size, self.grid
         )
-        out._indice_dict = self._indice_dict
+        out.indice_dict = self.indice_dict
         return out
 
     def dense(self, channels_first: bool = True) -> torch.Tensor:
@@ -148,10 +156,19 @@ class SparseConvTensor:
         return SparseConvTensor(features, indices, (D, H, W), B)
 
     def to(self, device) -> 'SparseConvTensor':
-        """设备迁移（CPU 版仅做 dtype/设备一致性）"""
-        self.features = self.features.to(device)
-        self.indices = self.indices.to(device)
-        return self
+        """设备迁移，返回新对象。新对象拥有独立的特征/坐标副本，修改不影响原对象。
+
+        注意：官方 spconv 的 SparseConvTensor.to() 同样返回新对象。
+        """
+        out = SparseConvTensor(
+            self.features.to(device).clone(),
+            self.indices.to(device).clone(),
+            self.spatial_shape,
+            self.batch_size,
+            self.grid,
+        )
+        out.indice_dict = self.indice_dict
+        return out
 
     def cpu(self) -> 'SparseConvTensor':
         return self.to('cpu')
@@ -174,6 +191,21 @@ class SparseModule(nn.Module):
 
     def forward(self, x: SparseConvTensor) -> SparseConvTensor:
         raise NotImplementedError
+
+
+# 运行时检测官方 spconv / mmcv.ops 是否可用，若可用则把对应的 SparseModule
+# 加入稀疏模块类型列表（mmdet3d 的 SparseBasicBlock 继承自官方或 mmcv 的
+# SparseModule，具体取决于 is_spconv2_available 的值）。
+_SPARSE_MODULE_TYPES: tuple = (SparseModule,)
+try:
+    import spconv.pytorch as _sp_pt
+    _SPARSE_MODULE_TYPES = (SparseModule, _sp_pt.SparseModule)
+except ImportError:
+    try:
+        from mmcv.ops import SparseModule as _mmcv_sp
+        _SPARSE_MODULE_TYPES = (SparseModule, _mmcv_sp)
+    except (ImportError, AttributeError):
+        pass
 
 
 class SparseSequential(SparseModule):
@@ -204,7 +236,7 @@ class SparseSequential(SparseModule):
         - 普通 nn.Module（BatchNorm/ReLU 等）只作用在 .features 上，再 replace_feature。
         """
         for module in self:
-            if isinstance(x, SparseConvTensor) and not isinstance(module, SparseModule):
+            if isinstance(x, SparseConvTensor) and not isinstance(module, _SPARSE_MODULE_TYPES):
                 x = x.replace_feature(module(x.features))
             else:
                 x = module(x)

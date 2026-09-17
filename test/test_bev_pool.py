@@ -2,25 +2,30 @@
 
 覆盖 unum_ops.bev_pool 接口，与 torch-native index_add_ 参考实现对比。
 
+本文件同时支持两种运行环境：
+  - NPU 环境：执行 AscendC kernel 正确性测试（TestBEVPoolNPU）
+  - 纯 CUDA 环境：执行 scatter_add 参考实现的 CUDA/CPU 交叉验证（TestBEVPoolVsCUDA）
+
 运行方式:
     cd /data/workspace/unum_ops
     PYTHONPATH=".venv/lib/python3.11/site-packages:$PYTHONPATH" \
         pytest test/test_bev_pool.py -v
 """
-import os
-import sys
-
 import pytest
 import torch
-import torch_npu
 
-torch.npu.set_compile_mode(jit_compile=False)
-torch.npu.set_device(0)
+try:
+    import torch_npu
+    NPU_AVAIL = torch.npu.is_available()
+except Exception:
+    NPU_AVAIL = False
+
+if NPU_AVAIL:
+    torch.npu.set_compile_mode(jit_compile=False)
+    torch.npu.set_device(0)
 
 from unum_ops.bev_pool import bev_pool, bev_pool_torch
 
-
-# ── Reference: bev_pool_torch (pure-PyTorch scatter_add, CPU) ──────────────
 
 def bev_pool_ref(feats, coords, B, D, H, W):
     return bev_pool_torch(feats, coords, B, D, H, W).out
@@ -53,13 +58,21 @@ def _run(feats, coords, B, D, H, W):
 
 @pytest.fixture(scope="session", autouse=True)
 def _warm_up_npu():
+    if not NPU_AVAIL:
+        yield
+        return
     feats, coords = _make_random_points(100, 1, 2, 4, 4, 8, seed=1)
     bev_pool(feats.npu().contiguous(), coords.npu().contiguous(), 1, 2, 4, 4)
     torch.npu.synchronize()
+    yield
 
 
-# ── Tests ──────────────────────────────────────────────────────────────────
+NPU_SKIP = pytest.mark.skipif(not NPU_AVAIL, reason="NPU not available")
 
+
+# ── AscendC kernel 测试（NPU 环境） ───────────────────────────────────────────
+
+@NPU_SKIP
 def test_small_random():
     """小规模随机数据，与 CPU index_add_ 参考对比。"""
     B, D, H, W, C = 1, 2, 4, 4, 8
@@ -71,6 +84,7 @@ def test_small_random():
         f"small random mismatch: max diff={torch.abs(out.cpu() - ref).max().item()}"
 
 
+@NPU_SKIP
 def test_medium_random():
     """中等规模随机数据。"""
     B, D, H, W, C = 2, 4, 8, 8, 16
@@ -79,9 +93,10 @@ def test_medium_random():
     ref = bev_pool_ref(feats, coords, B, D, H, W)
     out = _run(feats, coords, B, D, H, W)
     assert torch.allclose(out.cpu(), ref, atol=1e-5, rtol=1e-5), \
-        f"medium random mismatch"
+        "medium random mismatch"
 
 
+@NPU_SKIP
 def test_multibatch():
     """多 batch 测试。"""
     B, D, H, W, C = 2, 3, 5, 5, 8
@@ -92,6 +107,7 @@ def test_multibatch():
     assert torch.allclose(out.cpu(), ref, atol=1e-5, rtol=1e-5)
 
 
+@NPU_SKIP
 def test_single_point():
     """单点输入。"""
     B, D, H, W, C = 1, 1, 1, 1, 4
@@ -105,6 +121,7 @@ def test_single_point():
     assert torch.allclose(out[0, :, 0, 0, 0].cpu(), feats[0], atol=1e-5)
 
 
+@NPU_SKIP
 def test_multiple_points_same_voxel():
     """多点落入同一 voxel，应累加。"""
     B, D, H, W, C = 1, 1, 1, 1, 4
@@ -119,6 +136,7 @@ def test_multiple_points_same_voxel():
     assert torch.allclose(out.cpu(), expected, atol=1e-5)
 
 
+@NPU_SKIP
 def test_multiple_voxels():
     """多点分布到不同 voxel。"""
     B, D, H, W, C = 1, 1, 2, 2, 2
@@ -131,6 +149,7 @@ def test_multiple_voxels():
     assert torch.allclose(out.cpu(), ref, atol=1e-5)
 
 
+@NPU_SKIP
 def test_empty_points():
     """空点云（N=0）。"""
     B, D, H, W, C = 1, 2, 4, 4, 8
@@ -141,6 +160,7 @@ def test_empty_points():
     assert torch.allclose(out.cpu(), ref, atol=1e-5)
 
 
+@NPU_SKIP
 def test_large_channels():
     """较多通道数（C=80，BEVFusion 典型值）。"""
     B, D, H, W, C = 1, 2, 4, 4, 80
@@ -149,11 +169,12 @@ def test_large_channels():
     ref = bev_pool_ref(feats, coords, B, D, H, W)
     out = _run(feats, coords, B, D, H, W)
     assert torch.allclose(out.cpu(), ref, atol=1e-4, rtol=1e-4), \
-        f"large channels mismatch"
+        "large channels mismatch"
 
 
 # ── Output invariants ──────────────────────────────────────────────────────
 
+@NPU_SKIP
 def test_output_shape():
     """验证输出 shape 和 dtype。"""
     B, D, H, W, C = 2, 3, 5, 5, 16
@@ -169,6 +190,7 @@ def test_output_shape():
     assert out.dtype == torch.float32
 
 
+@NPU_SKIP
 def test_output_device():
     """验证输出在 NPU 上。"""
     B, D, H, W, C = 1, 2, 4, 4, 8
@@ -185,28 +207,38 @@ def test_output_device():
 
 # ── Edge cases ──────────────────────────────────────────────────────────────
 
-def _make_points(N, B, D, H, W, C, seed=42):
-    """生成随机点，与 _make_random_points 一致。"""
-    return _make_random_points(N, B, D, H, W, C, seed=seed)
-
-
+@NPU_SKIP
 def test_all_oob_points():
     """所有点都越界 → 输出全零。"""
     B, D, H, W, C = 1, 2, 4, 4, 8
     N = 20
-    feats, coords = _make_points(N, B, D, H, W, C, seed=6)
+    feats, coords = _make_random_points(N, B, D, H, W, C, seed=6)
     coords_oob = coords.clone()
     coords_oob[:, 0] = -2  # 全部 x 越界
     out = _run(feats, coords_oob, B, D, H, W)
     assert torch.all(out.cpu() == 0.0), "all OOB points should produce zero output"
 
 
+@NPU_SKIP
+def test_mixed_oob_points():
+    """部分点越界：越界点的坐标不应污染有效 voxel 的累加。"""
+    B, D, H, W, C = 1, 1, 2, 2, 2
+    feats = torch.tensor([[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [4.0, 4.0]],
+                         dtype=torch.float32)
+    coords = torch.tensor([[0, 0, 0, 0], [1, 0, 0, 0],
+                           [-1, 0, 0, 0], [5, 0, 0, 0]], dtype=torch.int64)  # 后两行越界
+    out = _run(feats, coords, B, D, H, W)
+    ref = bev_pool_ref(feats, coords, B, D, H, W)
+    assert torch.allclose(out.cpu(), ref, atol=1e-5)
+
+
+@NPU_SKIP
 def test_rank_int64_no_float_collision():
     """rank 用 int64 排序，大网格下不因 float32 精度碰撞而错。"""
     # 构造 W < H 且 rank 值很大的情况（旧公式 float 会碰撞）
     B, D, H, W, C = 2, 3, 10, 4, 8
     N = 500
-    feats, coords = _make_points(N, B, D, H, W, C, seed=11)
+    feats, coords = _make_random_points(N, B, D, H, W, C, seed=11)
     # 随机打乱输入顺序（Python 层负责排序）
     perm = torch.randperm(N)
     feats_shuf, coords_shuf = feats[perm], coords[perm]
@@ -216,11 +248,12 @@ def test_rank_int64_no_float_collision():
         f"int64 rank mismatch: max diff={torch.abs(out.cpu() - ref).max().item()}"
 
 
+@NPU_SKIP
 def test_non_contiguous_input():
     """非连续输入应被拒绝（binding TORCH_CHECK 抛错）。"""
     B, D, H, W, C = 1, 2, 4, 4, 8
     N = 50
-    feats, coords = _make_points(N, B, D, H, W, C, seed=7)
+    feats, coords = _make_random_points(N, B, D, H, W, C, seed=7)
     pts = feats.npu().contiguous()
     cs = coords.npu().contiguous()
     # 构造 rank 排序所需的输入（与 wrapper 一致），再制造非连续 feats
@@ -245,11 +278,12 @@ def test_non_contiguous_input():
                                 interval_lengths, int(B), int(D), int(H), int(W))
 
 
+@NPU_SKIP
 def test_wrong_dtype_input():
     """错误 dtype 输入应被拒绝（直接调底层算子）。"""
     B, D, H, W, C = 1, 2, 4, 4, 8
     N = 50
-    feats, coords = _make_points(N, B, D, H, W, C, seed=8)
+    feats, coords = _make_random_points(N, B, D, H, W, C, seed=8)
     pts = feats.npu().contiguous()
     cs = coords.npu().contiguous()
     ranks = (cs[:, 0] + cs[:, 1] * W + cs[:, 2] * (W * H) + cs[:, 3] * (W * H * D))
@@ -281,11 +315,12 @@ def test_wrong_dtype_input():
                                 int(B), int(D), int(H), int(W))
 
 
+@NPU_SKIP
 def test_invalid_grid_dims():
     """非正网格维度应被拒绝。"""
     B, D, H, W, C = 1, 2, 4, 4, 8
     N = 50
-    feats, coords = _make_points(N, B, D, H, W, C, seed=9)
+    feats, coords = _make_random_points(N, B, D, H, W, C, seed=9)
     pts = feats.npu().contiguous()
     cs = coords.npu().contiguous()
     with pytest.raises(RuntimeError):
@@ -298,13 +333,88 @@ def test_invalid_grid_dims():
         bev_pool(pts, cs, B, D, H, 0)   # W=0
 
 
+@NPU_SKIP
 def test_coords_wrong_columns():
     """coords 列数不为 4 应被拒绝（wrapper 在 rank 计算前检查）。"""
     B, D, H, W, C = 1, 2, 4, 4, 8
     N = 50
-    feats, coords = _make_points(N, B, D, H, W, C, seed=10)
+    feats, coords = _make_random_points(N, B, D, H, W, C, seed=10)
     pts = feats.npu().contiguous()
     cs = coords.npu().contiguous()
     bad_coords = cs[:, :3]  # 只有 3 列
     with pytest.raises((RuntimeError, IndexError)):
         bev_pool(pts, bad_coords, B, D, H, W)
+
+
+# ============================================================
+# bev_pool 参考实现 CUDA/CPU 交叉验证（纯 CUDA 环境可运行）
+# 验证 scatter_add 参考与 unum_ops bev_pool 使用的语义一致
+# ============================================================
+
+def bev_pool_ref_cuda(feats, coords, B, D, H, W):
+    """CUDA 参考实现：torch.scatter_add_ 按 voxel 索引累加。
+
+    输出布局与 bev_pool_torch / AscendC kernel 一致：(B, C, D, H, W)。
+    """
+    feats = feats.cuda().contiguous()
+    coords = coords.cuda().contiguous()
+    N, C = feats.shape
+    rank = (coords[:, 0] + coords[:, 1] * W
+            + coords[:, 2] * (W * H) + coords[:, 3] * (W * H * D))
+    out = torch.zeros(B * D * H * W, C, dtype=torch.float32, device="cuda")
+    out.index_add_(0, rank, feats)
+    return out.view(B, D, H, W, C).permute(0, 4, 1, 2, 3).contiguous()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+class TestBEVPoolVsCUDA:
+    def test_cuda_matches_cpu_reference(self):
+        """CUDA scatter_add 与纯 torch 参考（CPU scatter_add）一致"""
+        B, D, H, W, C = 1, 2, 4, 4, 8
+        N = 50
+        feats, coords = _make_random_points(N, B, D, H, W, C)
+        ref_cpu = bev_pool_ref(feats, coords, B, D, H, W)
+        ref_cuda = bev_pool_ref_cuda(feats, coords, B, D, H, W)
+        assert torch.allclose(ref_cpu, ref_cuda.cpu(), atol=1e-5, rtol=1e-5), \
+            "CUDA scatter_add should match CPU reference"
+
+    def test_medium_random(self):
+        """中等规模随机数据"""
+        B, D, H, W, C = 2, 4, 8, 8, 16
+        N = 500
+        feats, coords = _make_random_points(N, B, D, H, W, C, seed=123)
+        ref_cpu = bev_pool_ref(feats, coords, B, D, H, W)
+        ref_cuda = bev_pool_ref_cuda(feats, coords, B, D, H, W)
+        assert torch.allclose(ref_cpu, ref_cuda.cpu(), atol=1e-5, rtol=1e-5)
+
+    def test_multiple_points_same_voxel(self):
+        """多点同一 voxel 累加"""
+        B, D, H, W, C = 1, 1, 1, 1, 4
+        feats = torch.tensor([[1.0, 1.0, 1.0, 1.0],
+                              [2.0, 2.0, 2.0, 2.0],
+                              [3.0, 3.0, 3.0, 3.0]], dtype=torch.float32)
+        coords = torch.tensor([[0, 0, 0, 0],
+                               [0, 0, 0, 0],
+                               [0, 0, 0, 0]], dtype=torch.int64)
+        ref = bev_pool_ref_cuda(feats, coords, B, D, H, W)
+        expected = feats.sum(dim=0).reshape(B, C, D, H, W)
+        assert torch.allclose(ref.cpu(), expected, atol=1e-5)
+
+    def test_random_seeds(self):
+        """多种子下 CUDA scatter_add 与 CPU 参考一致"""
+        for seed in range(3):
+            B, D, H, W, C = 1, 2, 4, 4, 8
+            N = 100
+            feats, coords = _make_random_points(N, B, D, H, W, C, seed=seed)
+            ref_cpu = bev_pool_ref(feats, coords, B, D, H, W)
+            ref_cuda = bev_pool_ref_cuda(feats, coords, B, D, H, W)
+            assert torch.allclose(ref_cpu, ref_cuda.cpu(), atol=1e-5, rtol=1e-5), \
+                f"seed={seed} mismatch"
+
+    def test_empty_points(self):
+        """空点云应全零"""
+        B, D, H, W, C = 1, 2, 4, 4, 8
+        feats = torch.empty(0, C, dtype=torch.float32)
+        coords = torch.empty(0, 4, dtype=torch.int64)
+        ref = bev_pool_ref_cuda(feats, coords, B, D, H, W)
+        assert torch.all(ref.cpu() == 0.0)

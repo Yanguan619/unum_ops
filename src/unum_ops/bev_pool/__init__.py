@@ -145,13 +145,19 @@ def bev_pool_torch(feats, coords, B, D, H, W):
     CPU / NPU and be exported to ONNX.  The output layout is identical to
     the AscendC ``bev_pool`` kernel.
 
+    Coordinate / axis convention (matches BEVFusion / mmdet3d):
+      - coords ``(x, y, z, batch_id)``
+      - output ``out[b, z, h, w, :]`` where **h 轴对应 x、w 轴对应 y**
+        （BEV 鸟瞰图 H=前向 x、W=横向 y）
+      - flat = b*(W*H*D) + z*(W*H) + x*W + y
+
     Args:
         feats: (N, C) float32, features to scatter
         coords: (N, 4) int64, ``(x, y, z, batch_id)`` BEV grid coordinates
         B: batch size
         D: depth (z) dimension size
-        H: BEV height (y) dimension size
-        W: BEV width  (x) dimension size
+        H: BEV height (x) dimension size
+        W: BEV width  (y) dimension size
 
     Returns:
         BevPoolOutput.out: (B, C, D, H, W) float32
@@ -161,10 +167,11 @@ def bev_pool_torch(feats, coords, B, D, H, W):
     N, C = feats.shape
     coords = coords.long()
     # flat index matching the AscendC kernel output layout:
-    #   out[b, z, y, x, :] — flat = x + y*W + z*W*H + b*W*H*D
-    flat = (coords[:, 0] + coords[:, 1] * W +
+    #   out[b, z, x, y, :] — flat = b*(W*H*D) + z*(W*H) + x*W + y
+    flat = (coords[:, 3] * W * H * D +
             coords[:, 2] * W * H +
-            coords[:, 3] * W * H * D)
+            coords[:, 0] * W +
+            coords[:, 1])
     index = flat.unsqueeze(1).expand(-1, C)
     out = torch.zeros(B * D * H * W, C, dtype=feats.dtype, device=feats.device)
     out = torch.scatter_add(out, 0, index, feats)

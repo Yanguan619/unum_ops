@@ -425,11 +425,54 @@ class SparseConvolution(SparseModule):
         return nb
 
     def _downsample_coords(self, indices: torch.Tensor):
-        """计算 SparseConv（步长卷积）的输出坐标：floor(in / stride)"""
-        inds = indices.clone()
-        for d in range(self.ndim):
-            inds[:, d + 1] = inds[:, d + 1] // self.stride[d]
-        return inds
+        """计算 SparseConv（步长卷积）的输出坐标，与官方 spconv 语义一致。
+
+        官方 spconv 为 grid-based：输入点 c 被输出坐标 o 覆盖当且仅当
+          o*stride - padding <= c <= o*stride - padding + kernel - 1
+        即 o ∈ [ceil((c + padding - kernel + 1) / stride),
+                floor((c + padding) / stride)]
+        对所有输入点取并集（含边界过滤 + unique 由调用方完成）。
+        """
+        ndim = self.ndim
+        inds = indices.long()
+        N = inds.shape[0]
+        if N == 0:
+            return indices.clone()
+
+        los, his, ns = [], [], []
+        for d in range(ndim):
+            c = inds[:, d + 1]
+            lo = torch.ceil(
+                (c + self.padding[d] - self.kernel_size[d] + 1).float()
+                / self.stride[d]).long()
+            hi = torch.floor(
+                (c + self.padding[d]).float() / self.stride[d]).long()
+            n = (hi - lo + 1).clamp_min(0)
+            los.append(lo)
+            his.append(hi)
+            ns.append(n)
+
+        totals = ns[0]
+        for n in ns[1:]:
+            totals = totals * n
+        if totals.sum() == 0:
+            return indices[:0].clone()
+
+        device = indices.device
+        arange = lambda lo, hi: torch.arange(lo.item(), hi.item() + 1,
+                                             device=device)
+        flat = []
+        for i in range(N):
+            if totals[i] == 0:
+                continue
+            combos = itertools.product(
+                *[range(los[d][i].item(), his[d][i].item() + 1)
+                  for d in range(ndim)])
+            for combo in combos:
+                flat.append([inds[i, 0].item()] + list(combo))
+        if not flat:
+            return indices[:0].clone()
+        return torch.tensor(flat, dtype=indices.dtype, device=device)
 
     def forward(self, x: SparseConvTensor) -> SparseConvTensor:
         raise NotImplementedError
@@ -463,9 +506,9 @@ class SubMConv3d(SparseConvolution):
         out_feat = self._gather(features, nb)
         out = SparseConvTensor(out_feat, indices, x.spatial_shape, x.batch_size,
                                grid=x.grid)
-        out._indice_dict = dict(x._indice_dict)
+        out.indice_dict = dict(x.indice_dict)
         if self.indice_key is not None:
-            out._indice_dict[self.indice_key] = {
+            out.indice_dict[self.indice_key] = {
                 'in_coords': indices.clone(),
                 'stride': tuple(self.stride),
                 'padding': tuple(self.padding),
@@ -523,9 +566,9 @@ class SparseConv3d(SparseConvolution):
         spatial_shape = list(out_shape) + list(x.spatial_shape[self.ndim:])
         out = SparseConvTensor(out_feat, out_indices, spatial_shape, x.batch_size,
                                grid=x.grid)
-        out._indice_dict = dict(x._indice_dict)
+        out.indice_dict = dict(x.indice_dict)
         if self.indice_key is not None:
-            out._indice_dict[self.indice_key] = {
+            out.indice_dict[self.indice_key] = {
                 'in_coords': indices.clone(),
                 'in_shape': list(in_shape),
                 'stride': tuple(self.stride),
@@ -560,8 +603,8 @@ class SparseInverseConv3d(SparseConvolution):
     def forward(self, x: SparseConvTensor) -> SparseConvTensor:
         key = self.indice_key
         # 读取配对下采样卷积记录的 fine coords 与参数
-        if key is not None and key in x._indice_dict:
-            info = x._indice_dict[key]
+        if key is not None and key in x.indice_dict:
+            info = x.indice_dict[key]
             out_indices = info['in_coords']
             stride = tuple(info['stride'])
             padding = tuple(info['padding'])

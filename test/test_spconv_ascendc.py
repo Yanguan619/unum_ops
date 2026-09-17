@@ -12,18 +12,12 @@
 import os
 import sys
 
-import numpy as np
 import pytest
 import torch
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_PKG_ROOT = os.path.normpath(os.path.join(_HERE, "..", "src", "unum_ops"))
-if _PKG_ROOT not in sys.path:
-    sys.path.insert(0, _PKG_ROOT)
-
-from spconv import ascendc
-from spconv.conv import SubMConv3d, SparseConv3d, SparseInverseConv3d
-from spconv.sparse_modules import SparseConvTensor
+from unum_ops.spconv import ascendc
+from unum_ops.spconv.conv import SubMConv3d, SparseConv3d, SparseInverseConv3d
+from unum_ops.spconv.sparse_modules import SparseConvTensor
 
 NPU_AVAIL = hasattr(torch, "npu") and torch.npu.is_available()
 if NPU_AVAIL:

@@ -93,8 +93,10 @@ private:
         int32_t by = coordPtr_[(int64_t)start * 4 + 1];
         int32_t bz = coordPtr_[(int64_t)start * 4 + 2];
         int32_t batch = coordPtr_[(int64_t)start * 4 + 3];
-        uint64_t off = ((uint64_t)batch * t_->gridD + (uint64_t)bz) * t_->gridH + (uint64_t)by;
-        off = off * t_->gridW + (uint64_t)bx;
+        // BEVFusion 约定：coords=(x,y,z,batch)，输出 out[b, z, h=x, w=y]
+        // off = b*(W*H*D) + z*(W*H) + x*W + y
+        uint64_t off = ((uint64_t)batch * t_->gridD + (uint64_t)bz) * t_->gridH + (uint64_t)bx;
+        off = off * t_->gridW + (uint64_t)by;
         return off * t_->numChannels;
     }
 
@@ -104,8 +106,9 @@ private:
         int32_t by = coordPtr_[(int64_t)start * 4 + 1];
         int32_t bz = coordPtr_[(int64_t)start * 4 + 2];
         int32_t batch = coordPtr_[(int64_t)start * 4 + 3];
-        if (bx < 0 || bx >= (int32_t)t_->gridW) return false;
-        if (by < 0 || by >= (int32_t)t_->gridH) return false;
+        // BEVFusion 约定：x 对应 H 轴（gridH）、y 对应 W 轴（gridW）
+        if (bx < 0 || bx >= (int32_t)t_->gridH) return false;
+        if (by < 0 || by >= (int32_t)t_->gridW) return false;
         if (bz < 0 || bz >= (int32_t)t_->gridD) return false;
         if (batch < 0 || batch >= (int32_t)t_->gridB) return false;
         return true;

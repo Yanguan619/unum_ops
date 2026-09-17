@@ -121,4 +121,79 @@ def voxelization(
     )
 
 
-__all__ = ["voxelization", "VoxelizationOutput"]
+def voxelization_torch(
+    points: torch.Tensor,
+    voxel_size=DEFAULT_VOXEL_SIZE,
+    pcr=DEFAULT_PCR,
+    max_num_points: int = DEFAULT_MAX_NUM_POINTS,
+    max_voxels: int = DEFAULT_MAX_VOXELS,
+) -> VoxelizationOutput:
+    """纯 PyTorch 硬体素化（hard voxelization），CPU/GPU 通用，不依赖 CUDA 算子库。
+
+    与 CUDA 版 hard_voxelize 语义一致：
+      - 按输入顺序扫描点，voxel 按首次遇到顺序编号
+      - 每个 voxel 内取前 max_num_points 个点
+      - 输出 coords 为 (x, y, z)
+
+    Args:
+        points: (N, 4) float32, 点云 (x, y, z, intensity)
+        voxel_size: (vx, vy, vz) 每个 voxel 的尺寸
+        pcr: (x_min, y_min, z_min, x_max, y_max, z_max) 点云范围
+        max_num_points: 每个 voxel 最多点数
+        max_voxels: 最大 voxel 数
+
+    Returns:
+        VoxelizationOutput（可解包为 voxels, coords, num_points, num_voxels）
+    """
+    pts = points
+    vs = torch.as_tensor(voxel_size, dtype=torch.float32, device=pts.device)
+    cr = torch.as_tensor(pcr, dtype=torch.float32, device=pts.device)
+    N, feat_dim = pts.shape
+    if N == 0:
+        return VoxelizationOutput(
+            voxels=pts.new_zeros(0, max_num_points, feat_dim),
+            coords=pts.new_zeros(0, 3, dtype=torch.int32),
+            num_points=pts.new_zeros(0, dtype=torch.int32),
+            num_voxels=0,
+        )
+    # 体素坐标
+    coords = ((pts[:, :3] - cr[:3]) / vs).floor().long()
+    grid = torch.round((cr[3:] - cr[:3]) / vs).long()
+    valid = (coords >= 0).all(1) & (coords < grid).all(1)
+    coords_v = coords[valid]
+    pts_v = pts[valid]
+    Nv = pts_v.shape[0]
+    # 编码 key = (x, y, z) 用于 hash
+    key = (coords_v[:, 0] * grid[1] * grid[2] +
+           coords_v[:, 1] * grid[2] + coords_v[:, 2])
+    voxels = pts.new_zeros(max_voxels, max_num_points, feat_dim)
+    coords_out = pts.new_zeros(max_voxels, 3, dtype=torch.int)
+    num_pts = pts.new_zeros(max_voxels, dtype=torch.int64)
+    vmap = {}
+    vcnt = 0
+    for i in range(Nv):
+        k = int(key[i].item())
+        if k not in vmap:
+            if vcnt >= max_voxels:
+                continue
+            vmap[k] = vcnt
+            # 输出 coords 为 (x, y, z)
+            c = coords_v[i]
+            coords_out[vcnt, 0] = int(c[0].item())
+            coords_out[vcnt, 1] = int(c[1].item())
+            coords_out[vcnt, 2] = int(c[2].item())
+            vcnt += 1
+        vidx = vmap[k]
+        if int(num_pts[vidx].item()) < max_num_points:
+            n = int(num_pts[vidx].item())
+            voxels[vidx, n] = pts_v[i]
+            num_pts[vidx] = n + 1
+    return VoxelizationOutput(
+        voxels=voxels[:vcnt],
+        coords=coords_out[:vcnt],
+        num_points=num_pts[:vcnt].to(torch.int32),
+        num_voxels=vcnt,
+    )
+
+
+__all__ = ["voxelization", "voxelization_torch", "VoxelizationOutput"]
