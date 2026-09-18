@@ -144,17 +144,21 @@ VoxelizationOutputs voxelization(const at::Tensor& points, c10::ArrayRef<double>
     // workspace 写在 voxels 尾部无影响），省去 aclrtMalloc + D2D 拷贝。
     at::Tensor voxels = at::empty({max_voxels, max_num_points, 4},
                                   points.options().dtype(at::kFloat));
-    at::Tensor coords = at::empty({max_voxels, 3},
+    // 310P: GM 写必须 32B 对齐。coords 输出填充为 (maxVoxels, 8) int32（32B/voxel 槽位），
+    // num_points 填充为 (maxVoxels, 8) int32，让 WriteCoordsNpts 能用 MTE3 DataCopy 写输出
+    // （标量 GM store 在 310P 多 voxel 下不全部落 GM）。
+    // Python 层切片 coords[:, :3]、num_points[:, 0]。
+    at::Tensor coords = at::empty({max_voxels, 8},
                                   points.options().dtype(at::kInt));
-    at::Tensor num_points = at::empty({max_voxels},
+    at::Tensor num_points = at::empty({max_voxels, 8},
                                       points.options().dtype(at::kInt));
     at::Tensor num_voxels = at::empty({1}, points.options().dtype(at::kInt));
 
     aclTensor* ptsTensor = MakeTensor(/*ACL_FLOAT*/ 0, {N, 4}, points.data_ptr());
     aclTensor* voxTensor = MakeTensor(/*ACL_FLOAT*/ 0, {max_voxels, max_num_points, 4},
                                       voxels.data_ptr());
-    aclTensor* coordTensor = MakeTensor(/*ACL_INT32*/ 3, {max_voxels, 3}, coords.data_ptr());
-    aclTensor* nptsTensor = MakeTensor(/*ACL_INT32*/ 3, {max_voxels}, num_points.data_ptr());
+    aclTensor* coordTensor = MakeTensor(/*ACL_INT32*/ 3, {max_voxels, 8}, coords.data_ptr());
+    aclTensor* nptsTensor = MakeTensor(/*ACL_INT32*/ 3, {max_voxels, 8}, num_points.data_ptr());
     aclTensor* nvoxTensor = MakeTensor(/*ACL_INT32*/ 3, {1}, num_voxels.data_ptr());
 
     float vs[3] = {(float)voxel_size[0], (float)voxel_size[1], (float)voxel_size[2]};

@@ -49,10 +49,13 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     uint32_t blockNum = (coreNum < VOXEL_MAX_CORES) ? coreNum : VOXEL_MAX_CORES;
 
     uint32_t padN = RoundUp32(numPoints);
+    // binsPerCore 向上取整到 8（32B），保证每核 bin 区间不共享同一个 8-int32 DataCopy 块
+    uint32_t binsPerCore = (gridTotal + blockNum - 1) / blockNum;
+    binsPerCore = (binsPerCore + 7u) & ~7u;
     // sync 保留区域（硬件 SyncAll 不使用，仅保持布局稳定）
     uint64_t syncBytes = (uint64_t)blockNum * 2 * 8 * sizeof(int32_t);
     uint64_t offLocalCnt = syncBytes;
-    uint64_t offVid = offLocalCnt + (uint64_t)blockNum * gridTotal * sizeof(int32_t);
+    uint64_t offVid = offLocalCnt + (uint64_t)blockNum * binsPerCore * sizeof(int32_t);
     uint64_t offPtLocalPos = offVid + (uint64_t)gridTotal * sizeof(int32_t);
     uint64_t offBlockSum = offPtLocalPos + (uint64_t)blockNum * padN * sizeof(int32_t);
     // coords/npts 暂存区：每 vid 一个 32B 槽位（8 int32），容量 padN（vid < M <= numPoints <= padN）
@@ -69,9 +72,6 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     tiling->gridTotal = gridTotal;
     tiling->maxNumPoints = maxNumPoints;
     tiling->maxVoxels = maxVoxels;
-    // binsPerCore 向上取整到 8（32B），保证每核 bin 区间不共享同一个 8-int32 DataCopy 块
-    uint32_t binsPerCore = (gridTotal + blockNum - 1) / blockNum;
-    binsPerCore = (binsPerCore + 7u) & ~7u;
     tiling->binsPerCore = binsPerCore;
     tiling->voxelSizeX = vsData[0];
     tiling->voxelSizeY = vsData[1];
@@ -152,7 +152,7 @@ static ge::graphStatus InferShape(gert::InferShapeContext* context)
     }
     coords_shape->SetDimNum(2);
     coords_shape->SetDim(0, maxV);
-    coords_shape->SetDim(1, 3);
+    coords_shape->SetDim(1, 8);
 
     gert::Shape* num_points_shape = context->GetOutputShape(2);
     if (num_points_shape == nullptr) {
@@ -160,8 +160,9 @@ static ge::graphStatus InferShape(gert::InferShapeContext* context)
         if (f) { fprintf(f, "[DEBUG] InferShape: num_points_shape is null\n"); fclose(f); }
         return ge::GRAPH_FAILED;
     }
-    num_points_shape->SetDimNum(1);
+    num_points_shape->SetDimNum(2);
     num_points_shape->SetDim(0, maxV);
+    num_points_shape->SetDim(1, 8);
 
     gert::Shape* num_voxels_shape = context->GetOutputShape(3);
     if (num_voxels_shape == nullptr) {

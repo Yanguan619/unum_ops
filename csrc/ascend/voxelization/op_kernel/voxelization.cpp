@@ -50,8 +50,7 @@ public:
         __gm__ int32_t* wsBase = (__gm__ int32_t*)userWS;
 
         // workspace 指针（全部指向 voxels 输出 tensor 内）
-        localCntPtr_ = wsBase + (tiling->offLocalCnt / sizeof(int32_t))
-                     + core_ * tiling->gridTotal;
+        localCntPtr_ = wsBase + (tiling->offLocalCnt / sizeof(int32_t));
         vidPtr_ = wsBase + (tiling->offVid / sizeof(int32_t));
         ptLocalPosPtr_ = wsBase + (tiling->offPtLocalPos / sizeof(int32_t))
                        + core_ * tiling->padNumPoints;  // 每核独立 ptLocalPos 区域
@@ -69,8 +68,8 @@ public:
         pointsGm_.SetGlobalBuffer((__gm__ float*)points, (int64_t)tiling->numPoints * 4);
         pointsPtr_ = (__gm__ float*)points;
         voxPtr_ = (__gm__ float*)voxels;
-        coordPtr_ = (__gm__ int32_t*)coords;
-        numPtPtr_ = (__gm__ int32_t*)numPointsOut;
+        coordGm_.SetGlobalBuffer((__gm__ int32_t*)coords, (int64_t)tiling->maxVoxels * 8);
+        nptGm_.SetGlobalBuffer((__gm__ int32_t*)numPointsOut, (int64_t)tiling->maxVoxels * 8);
         numVoxelsPtr_ = (__gm__ int32_t*)numVoxelsOut;
 
         // UB buffer
@@ -101,22 +100,27 @@ public:
 
     __aicore__ inline void Process()
     {
-        // 各阶段核间数据依赖分析：
-        //   InitWorkspace/CountPoints/BlockCount   —— 只读写本核 bin 区间，无跨核依赖
-        //   SyncAll                                —— blockSum 归约同步点（硬件跨核同步）
-        //   AssignVoxelIds/ScatterPoints           —— 只读写本核区间 + 读全部 blockSum
-        //   WriteCoordsNpts                        —— 每核写自己 vid 区间输出，只读本核 scratch，无跨核依赖
+        // 310P MTE3→MTE2 GM 可见性需要硬事件同步（PipeBarrier/SyncAll 不足）
         InitWorkspace();
         CountPoints();
         BlockCount();
         AscendC::SyncAll<true>();
         AssignVoxelIds();
         ScatterPoints();
-        // 不需要第二次 SyncAll：每个核写自己 vid 区间的 coords/npts 输出，只读自己写的 scratch
         WriteCoordsNpts();
+        AscendC::SyncAll<true>();
+        AscendC::PipeBarrier<PIPE_ALL>();
     }
 
     private:
+    template <AscendC::HardEvent evt>
+    __aicore__ inline void HardSync()
+    {
+        auto id = pipe_->template AllocEventID<evt>();
+        AscendC::SetFlag<evt>(id);
+        AscendC::WaitFlag<evt>(id);
+    }
+
     __aicore__ inline void InitOffsetTable()
     {
         AscendC::LocalTensor<uint32_t> off = bufOffset_.Get<uint32_t>();
@@ -266,19 +270,28 @@ public:
                 int32_t zv = zi.GetValue(i);
                 if (!IsPointValid(off, i, n, xv, yv, zv)) continue;
                 if (b < (int32_t)startB || b >= (int32_t)endBin_) continue;
-                uint32_t blkLocal = (((uint32_t)b & ~7u) - startB) >> 3;
-                int32_t val = map.GetValue(blkLocal);
+                uint32_t blkBase = (uint32_t)b & ~7u;
+                uint32_t blkLocal = (blkBase - startB) >> 3;
+                uint32_t blkHash = blkLocal % (uint32_t)VOXEL_BIN_CHUNK;
+                int32_t val = map.GetValue((int32_t)blkHash);
                 if ((uint32_t)(val >> 10) == epoch) {
-                    // 已有组：尾插法保持扫描序
                     uint32_t g = (uint32_t)(val & 0x3FF) - 1;
-                    nxt.SetValue(tail.GetValue(g), (int32_t)i);
-                    tail.SetValue(g, (int32_t)i);
-                    nxt.SetValue(i, -1);
+                    uint32_t existingBase = (uint32_t)base.GetValue((int32_t)g);
+                    if (existingBase == blkBase) {
+                        nxt.SetValue(tail.GetValue(g), (int32_t)i);
+                        tail.SetValue(g, (int32_t)i);
+                        nxt.SetValue(i, -1);
+                    } else {
+                        FlushCountGroup(bin, posBlk, cnt, (int32_t)existingBase, head.GetValue(g), nxt);
+                        map.SetValue((int32_t)blkHash, (int32_t)((epoch << 10) | (g + 1)));
+                        base.SetValue(g, (int32_t)blkBase);
+                        head.SetValue(g, (int32_t)i);
+                        tail.SetValue(g, (int32_t)i);
+                        nxt.SetValue(i, -1);
+                    }
                 } else {
-                    // 新组（组号 0..511，编码 g+1 用 10 位）
                     uint32_t g = nGroups;
-                    uint32_t blkBase = (uint32_t)b & ~7u;
-                    map.SetValue(blkLocal, (int32_t)((epoch << 10) | (g + 1)));
+                    map.SetValue((int32_t)blkHash, (int32_t)((epoch << 10) | (g + 1)));
                     base.SetValue(g, (int32_t)blkBase);
                     head.SetValue(g, (int32_t)i);
                     tail.SetValue(g, (int32_t)i);
@@ -300,6 +313,30 @@ public:
             AscendC::DataCopy(ptLocalPosGm_[off], posBlk, alignedCnt);
             AscendC::PipeBarrier<PIPE_ALL>();
         }
+    }
+
+    __aicore__ inline void FlushCountGroup(
+        AscendC::LocalTensor<int32_t>& bin,
+        AscendC::LocalTensor<int32_t>& posBlk,
+        uint32_t n,
+        int32_t baseV,
+        int32_t headV,
+        AscendC::LocalTensor<int32_t>& nxt)
+    {
+        AscendC::LocalTensor<int32_t> ub = bufRaw_.Get<int32_t>();
+        AscendC::DataCopy(ub, localCntGm_[baseV], 8);
+        AscendC::PipeBarrier<PIPE_ALL>();
+        int32_t p = headV;
+        while (p >= 0 && (uint32_t)p < n) {
+            uint32_t idx = (uint32_t)bin.GetValue((uint32_t)p) - (uint32_t)baseV;
+            int32_t v = ub.GetValue(idx);
+            ub.SetValue(idx, v + 1);
+            posBlk.SetValue((uint32_t)p, v);
+            p = nxt.GetValue((uint32_t)p);
+        }
+        AscendC::PipeBarrier<PIPE_ALL>();
+        AscendC::DataCopy(localCntGm_[baseV], ub, 8);
+        AscendC::PipeBarrier<PIPE_ALL>();
     }
 
     __aicore__ inline void FlushCountGroups(AscendC::LocalTensor<int32_t>& bin,
@@ -350,6 +387,7 @@ public:
         // DataCopy 写 blockSum（跨核需要 MTE3 可见）
         AscendC::LocalTensor<int32_t> bsUb = bufW_.Get<int32_t>();
         bsUb.SetValue(0, (int32_t)blockCnt);
+        AscendC::PipeBarrier<PIPE_ALL>();
         AscendC::DataCopy(blockSumGm_[core_ * 8], bsUb, 8);
         AscendC::PipeBarrier<PIPE_ALL>();
     }
@@ -431,7 +469,6 @@ public:
         AscendC::LocalTensor<int32_t> vidBlk = bufT_.Get<int32_t>();
         AscendC::LocalTensor<int32_t> posBlk = bufW_.Get<int32_t>();
         AscendC::LocalTensor<int32_t> cntBlk = bufXF_.Get<int32_t>();
-
         for (uint32_t off = 0; off < n; off += VOXEL_TILE_POINTS) {
             uint32_t cnt = VoxMinU(VOXEL_TILE_POINTS, n - off);
             uint32_t alignedCnt = (cnt + 7u) & ~7u;
@@ -439,9 +476,7 @@ public:
             ComputeTile(cnt);
             AscendC::PipeBarrier<PIPE_ALL>();
 
-            AscendC::DataCopy(posBlk, ptLocalPosGm_[off], alignedCnt);
-            AscendC::PipeBarrier<PIPE_ALL>();
-
+            // [DIAG]
             // 缓存上一 blkBase 的 vid/cnt，避免同一 8-bin 块内逐点 DataCopy
             uint32_t lastBlk = UINT32_MAX;
             // 310P 标量寄存器可存 8 个 int32；用 local stack 变量
@@ -469,7 +504,7 @@ public:
                     float yvF = yt.GetValue(i);
                     float zvF = zt.GetValue(i);
                     float iv = it.GetValue(i);
-                    __gm__ float* vp = voxPtr_ + ((uint64_t)vid * maxPts + pos) * 4;
+volatile __gm__ float* vp = voxPtr_ + ((uint64_t)vid * maxPts + pos) * 4;
                     vp[0] = xvF;
                     vp[1] = yvF;
                     vp[2] = zvF;
@@ -485,9 +520,9 @@ public:
                         cntBlk.SetValue(5, 0);
                         cntBlk.SetValue(6, 0);
                         cntBlk.SetValue(7, 0);
-                        AscendC::DataCopy(scrGm_[(int64_t)vid * 8], cntBlk, 8);
                         AscendC::PipeBarrier<PIPE_ALL>();
-                        // cntBlk 被 scratch 覆盖，下一不同 blkBase 时自动重读
+                        AscendC::DataCopy(scrGm_[vid * 8], cntBlk, 8);
+                        AscendC::PipeBarrier<PIPE_ALL>();
                         lastBlk = UINT32_MAX;
                     }
                 }
@@ -499,10 +534,15 @@ public:
     // 每个核写自己 vid 区间的 coords/npts 输出（单写者：不同核写不同 vid，无缓存行竞争）。
     // 只读本核 ScatterPoints 写入的 scratch 槽位（同核 MTE3 写 → MTE2 读，缓存一致），
     // 因此不需要第二次 SyncAll，从根上避免跨核 MTE3 写可见性问题。
+    // ScatterPoints 已经直接写完了 coords 和 num_points，WriteCoordsNpts 只计算总 voxel 数
+    // 不需要再次同步——blockSum 在 BlockCount+SysncAll 后已固定
     __aicore__ inline void WriteCoordsNpts()
     {
+        // 310P：标量 __gm__ store 写 coords/num_points 不可靠（写缓冲不被 SyncAll 冲刷），
+        // 改为 UB 缓冲 + DataCopy(MTE3) 写 GM，由末尾 SyncAll 保证落地。
         AscendC::LocalTensor<int32_t> blk = bufT_.Get<int32_t>();
-        // MTE2 读全部 blockSum
+        AscendC::LocalTensor<int32_t> coordUb = bufBin_.Get<int32_t>();
+        AscendC::LocalTensor<int32_t> nptUb = bufW_.Get<int32_t>();
         uint32_t bsFloats = ((t_->blockNum * 8) + 7u) & ~7u;
         AscendC::DataCopy(blk, blockSumGm_, bsFloats);
         AscendC::PipeBarrier<PIPE_ALL>();
@@ -514,30 +554,63 @@ public:
             total += s;
         }
         total = VoxMinU(total, t_->maxVoxels);
-        if (core_ == 0) {
-            numVoxelsPtr_[0] = (int32_t)total;
-        }
-        // 本核 vid 区间 [blockOff, blockOff + myCount)
-        uint32_t myCount = VoxMinU((uint32_t)blk.GetValue(core_ * 8), total - blockOff);
+        uint32_t myCount = VoxMinU(total - blockOff, t_->maxVoxels - blockOff);
+        // 覆盖 maxVoxels 截断：仅截断点数的区域写入，其余 vid 区不写（保持 0）
         for (uint32_t v = blockOff; v < blockOff + myCount; v += 8) {
             uint32_t cnt8 = VoxMinU(8, blockOff + myCount - v);
             AscendC::DataCopy(blk, scrGm_[(int64_t)v * 8], (int32_t)(cnt8 * 8));
             AscendC::PipeBarrier<PIPE_ALL>();
+            // 输出为 8 int32/voxel 的 32B 对齐槽位（310P DataCopy 对齐要求）
             for (uint32_t j = 0; j < cnt8; j++) {
                 int32_t vid = blk.GetValue((int32_t)j * 8);
-                if (vid != (int32_t)(v + j)) continue;  // 槽位未写（maxVoxels 截断）
+                if (vid != (int32_t)(v + j)) {
+                    coordUb.SetValue((int32_t)j * 8, 0);
+                    coordUb.SetValue((int32_t)j * 8 + 1, 0);
+                    coordUb.SetValue((int32_t)j * 8 + 2, 0);
+                    coordUb.SetValue((int32_t)j * 8 + 3, 0);
+                    coordUb.SetValue((int32_t)j * 8 + 4, 0);
+                    coordUb.SetValue((int32_t)j * 8 + 5, 0);
+                    coordUb.SetValue((int32_t)j * 8 + 6, 0);
+                    coordUb.SetValue((int32_t)j * 8 + 7, 0);
+                    nptUb.SetValue((int32_t)j * 8, 0);
+                    nptUb.SetValue((int32_t)j * 8 + 1, 0);
+                    nptUb.SetValue((int32_t)j * 8 + 2, 0);
+                    nptUb.SetValue((int32_t)j * 8 + 3, 0);
+                    nptUb.SetValue((int32_t)j * 8 + 4, 0);
+                    nptUb.SetValue((int32_t)j * 8 + 5, 0);
+                    nptUb.SetValue((int32_t)j * 8 + 6, 0);
+                    nptUb.SetValue((int32_t)j * 8 + 7, 0);
+                    continue;
+                }
                 int32_t zv = blk.GetValue((int32_t)j * 8 + 1);
                 int32_t yv = blk.GetValue((int32_t)j * 8 + 2);
                 int32_t xv = blk.GetValue((int32_t)j * 8 + 3);
                 int32_t cntV = blk.GetValue((int32_t)j * 8 + 4);
-                __gm__ int32_t* cp = coordPtr_ + (uint64_t)(v + j) * 3;
-                cp[0] = zv;
-                cp[1] = yv;
-                cp[2] = xv;
-                numPtPtr_[v + j] = cntV;
+                coordUb.SetValue((int32_t)j * 8, zv);
+                coordUb.SetValue((int32_t)j * 8 + 1, yv);
+                coordUb.SetValue((int32_t)j * 8 + 2, xv);
+                coordUb.SetValue((int32_t)j * 8 + 3, 0);
+                coordUb.SetValue((int32_t)j * 8 + 4, 0);
+                coordUb.SetValue((int32_t)j * 8 + 5, 0);
+                coordUb.SetValue((int32_t)j * 8 + 6, 0);
+                coordUb.SetValue((int32_t)j * 8 + 7, 0);
+                nptUb.SetValue((int32_t)j * 8, cntV);
+                nptUb.SetValue((int32_t)j * 8 + 1, 0);
+                nptUb.SetValue((int32_t)j * 8 + 2, 0);
+                nptUb.SetValue((int32_t)j * 8 + 3, 0);
+                nptUb.SetValue((int32_t)j * 8 + 4, 0);
+                nptUb.SetValue((int32_t)j * 8 + 5, 0);
+                nptUb.SetValue((int32_t)j * 8 + 6, 0);
+                nptUb.SetValue((int32_t)j * 8 + 7, 0);
             }
+            AscendC::PipeBarrier<PIPE_ALL>();
+            AscendC::DataCopy(coordGm_[(int64_t)v * 8], coordUb, (int32_t)(cnt8 * 8));
+            AscendC::DataCopy(nptGm_[(int64_t)v * 8], nptUb, (int32_t)(cnt8 * 8));
+            AscendC::PipeBarrier<PIPE_ALL>();
         }
-        AscendC::PipeBarrier<PIPE_ALL>();
+        if (core_ == 0) {
+            nvoxGm_.SetValue(0, (int32_t)total);
+        }
     }
 
 private:
@@ -550,18 +623,20 @@ private:
     __gm__ int32_t* vidPtr_;
     __gm__ int32_t* ptLocalPosPtr_;
     __gm__ int32_t* blockSumPtr_;
-    __gm__ int32_t* numVoxelsPtr_;
     __gm__ int32_t* scrPtr_;
     AscendC::GlobalTensor<int32_t> scrGm_;
     AscendC::GlobalTensor<int32_t> blockSumGm_;
     AscendC::GlobalTensor<float> pointsGm_;
     __gm__ float* pointsPtr_;
+    __gm__ float* voxPtr_;
+    __gm__ int32_t* numVoxelsPtr_;
     AscendC::GlobalTensor<int32_t> localCntGm_;
     AscendC::GlobalTensor<int32_t> ptLocalPosGm_;
     AscendC::GlobalTensor<int32_t> vidGm_;
-    __gm__ float* voxPtr_;
-    __gm__ int32_t* coordPtr_;
-    __gm__ int32_t* numPtPtr_;
+    AscendC::GlobalTensor<float> voxGm_;
+    AscendC::GlobalTensor<int32_t> coordGm_;
+    AscendC::GlobalTensor<int32_t> nptGm_;
+    AscendC::GlobalTensor<int32_t> nvoxGm_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> bufRaw_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> bufX_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> bufY_;

@@ -103,26 +103,37 @@ def bev_pool(feats, coords, B, D, H, W):
         out = out.permute(0, 4, 1, 2, 3).contiguous()
         return BevPoolOutput(out=out)
 
-    ranks = (
-        coords[:, 0] + coords[:, 1] * W + coords[:, 2] * (W * H) +
-        coords[:, 3] * (W * H * D))
-    # float32 argsort 在 AiCore 上运行（快）；int64 回退到 AiCpu（慢 100x）。
-    # 当网格体素数 > 2^24 时 float32 无法区分相邻 rank，此时用 int64 兜底。
-    # 该场景极罕见（需要 >1600 万体素），实际中几乎不会触发。
-    _MAX_FLOAT32_PRECISE_VOXELS = 1 << 24
-    indices = (ranks.argsort() if B * D * H * W > _MAX_FLOAT32_PRECISE_VOXELS
-               else ranks.float().argsort())
-    # index_select 比 feats[indices] 快 ~10x（NPU 随机读优化）
-    feats = torch.index_select(feats, 0, indices)
-    coords = torch.index_select(coords, 0, indices).int().contiguous()
-    ranks_sorted = ranks[indices]
+    # 快路径：网格 ≤ 2^24 时 ranks 用 int32 计算 + float32 一次性 sort。
+    # - int32/int64 的 sort/argsort 落 AiCpu（慢 ~20x），必须 float32 排序；
+    # - torch.sort 同时返回排序值和索引，省掉 ranks[indices] 的 int64 gather
+    #   （实测 2M 点：argsort 17.8 + ranks gather 14.8 → sort 17.6ms）。
+    # - coords 先转 int32 再 gather，搬运量减半。
+    # rank 公式与官方 BEVFusion 一致（原生 [x,y,z,b] 输入，x 慢 y 快，
+    # 任意网格形状下单射）；2026-09-18 起与 kernel CoordOffset 同约定。
+    _MAX_INT32_PRECISE_VOXELS = 1 << 24
+    if B * D * H * W <= _MAX_INT32_PRECISE_VOXELS:
+        coords32 = coords.int()
+        ranks = (coords32[:, 0] * W + coords32[:, 1] +
+                 coords32[:, 2] * (W * H) + coords32[:, 3] * (W * H * D))
+        ranks_sorted, indices = torch.sort(ranks.float(), stable=True)
+        feats = torch.index_select(feats, 0, indices)
+        coords = torch.index_select(coords32, 0, indices)
+    else:
+        # 罕见兜底：网格 > 2^24（int32 ranks 可能溢出 2^31）时走 int64 路径
+        ranks = (coords[:, 0] * W + coords[:, 1] +
+                 coords[:, 2] * (W * H) + coords[:, 3] * (W * H * D))
+        indices = ranks.argsort()
+        feats = torch.index_select(feats, 0, indices)
+        coords = torch.index_select(coords, 0, indices).int().contiguous()
+        ranks_sorted = ranks[indices]
 
     kept = torch.ones(N, device=device, dtype=torch.bool)
     kept[1:] = ranks_sorted[1:] != ranks_sorted[:-1]
     interval_starts = torch.where(kept)[0].int().contiguous()
-    interval_lengths = torch.zeros_like(interval_starts)
-    interval_lengths[:-1] = interval_starts[1:] - interval_starts[:-1]
-    interval_lengths[-1] = N - interval_starts[-1]
+    # NPU bug workaround: `[:-1] = ...` 就地切片赋值会多写末位元素，用 cat 规避
+    interval_lengths = torch.cat((
+        interval_starts[1:] - interval_starts[:-1],
+        (N - interval_starts[-1:]).to(interval_starts.dtype)))
 
     out = torch.ops.unum.bev_pool(
         feats,

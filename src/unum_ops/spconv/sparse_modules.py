@@ -31,6 +31,11 @@ class SparseConvTensor:
         self.grid = grid
         # 记录是否有索引映射（用于 replace_feature / SparseInverseConv）
         self._indice_dict: Dict[str, Any] = {}
+        # 帧级邻居表缓存：同一帧前向传播中，同参数卷积层作用于相同 coords 时
+        # 共享邻居表（官方 spconv 按 indice_key 共享 indice pairs 的等价物）。
+        # 每次构造新 tensor 即新缓存——无跨帧陈旧数据风险；由各卷积层 forward
+        # 与 replace_feature 传播。
+        self._layer_nb_cache: dict = {}
 
     @property
     def indice_dict(self):
@@ -61,6 +66,7 @@ class SparseConvTensor:
             self.batch_size, self.grid
         )
         out.indice_dict = self.indice_dict
+        out._layer_nb_cache = self._layer_nb_cache
         return out
 
     def dense(self, channels_first: bool = True) -> torch.Tensor:
