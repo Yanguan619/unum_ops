@@ -1,0 +1,54 @@
+[
+    {
+        "op": "BEVPoolV3",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "depth",
+                "param_type": "optional",
+                "format": ["ND"],
+                "type": ["float32"]
+            },
+            {
+                "name": "feat",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float32"]
+            },
+            {
+                "name": "ranks_depth",
+                "param_type": "optional",
+                "format": ["ND"],
+                "type": ["int32"]
+            },
+            {
+                "name": "ranks_feat",
+                "param_type": "optional",
+                "format": ["ND"],
+                "type": ["int32"]
+            },
+            {
+                "name": "ranks_bev",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["int32"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "out",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float32"]
+            }
+        ],
+        "attr": [
+            {"name": "with_depth", "param_type": "required", "type": "bool"},
+            {"name": "b", "param_type": "required", "type": "int"},
+            {"name": "d", "param_type": "required", "type": "int"},
+            {"name": "h", "param_type": "required", "type": "int"},
+            {"name": "w", "param_type": "required", "type": "int"},
+            {"name": "c", "param_type": "required", "type": "int"}
+        ]
+    }
+]

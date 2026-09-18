@@ -10,6 +10,7 @@ build_out/
 *.run
 csrc/ascend/voxelization/test/data/output/
 *.om
+*.so
 csrc/ascend/custom_op_temp/
 **/check_result.json
 

@@ -1,5 +1,9 @@
 # Agent Instructions
 
+cuda迁移算子步骤:cuda -> torch-native -> ascendC。（除非用户要求使用triton，否则不实现triton版本）
+
+torch-native必须与cuda算子行为一致，ascendC必须与torch-native行为一致。
+
 ## Build & Test Commands
 
 ```bash
