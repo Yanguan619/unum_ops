@@ -14,18 +14,11 @@
 
 结果写入 benchmark/output/<plot_name>.txt
 """
-import os
-import sys
-
-_HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(_HERE, "..", "src", "unum_ops"))
-sys.path.insert(0, _HERE)
-
 import pytest
 import torch
 
 from bench_utils import Benchmark, do_bench, perf_report
-from pointnet2 import (
+from unum_ops.pointnet2 import (
     CylinderQueryAndGroup,
     QueryAndGroup,
     ball_query,

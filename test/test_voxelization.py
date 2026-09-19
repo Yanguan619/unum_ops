@@ -10,7 +10,9 @@
     cd /data/workspace/unum_ops
     python -m pytest test/test_voxelization.py -v
 """
+import gc
 import os
+import time
 
 import numpy as np
 import pytest
@@ -366,3 +368,75 @@ class TestVoxelizationVsMMCVCUDA:
             _, c_loc_s, _ = _sort_voxel_sets(v_loc, c_loc, n_loc)
             _, c_ref_s, _ = _sort_voxel_sets(v_ref, c_ref, n_ref)
             assert np.array_equal(c_loc_s, c_ref_s), f"seed={seed} coords mismatch"
+
+
+# ============================================================
+# 连续调用稳定性（voxelization 长稳压测）
+# ============================================================
+
+def _voxel_once(N, seed):
+    """单次 voxelization 调用，返回 num_voxels。"""
+    np.random.seed(seed)
+    points = np.random.randn(N, 4).astype(np.float32)
+    pts = torch.from_numpy(points.copy()).npu()
+    out = voxelization(pts)
+    torch.npu.synchronize()
+    return out.num_voxels
+
+
+def _voxel_check(nvox, label=""):
+    """voxelization 应返回 >0 的 num_voxels。
+    用正整数确认 kernel 正常执行而非静默返回 0。"""
+    if nvox < 0:
+        return False, f"num_voxels < 0: {nvox}"
+    if nvox == 0:
+        return False, f"num_voxels == 0 ({label}): kernel 可能静默失败"
+    return True, ""
+
+
+@NPU_SKIP
+class TestVoxelizationStability:
+    """voxelization 连续多轮调用稳定性"""
+
+    def test_small_loop(self):
+        """小参数长稳：500 次随机参数连续调用。"""
+        errors = []
+        for i in range(1, 501):
+            try:
+                N = int(np.random.randint(500, 50000))
+                nvox = _voxel_once(N, seed=i * 100)
+                ok, msg = _voxel_check(nvox, f"small_loop i={i}")
+                if not ok:
+                    errors.append((i, msg))
+            except Exception as e:
+                errors.append((i, str(e)[:80]))
+            if i % 200 == 0:
+                gc.collect()
+                torch.npu.synchronize()
+                torch.npu.empty_cache()
+        assert not errors, f"voxelization 长稳压测失败：{len(errors)} 个错误, 前5: {errors[:5]}"
+
+    def test_large_loop(self):
+        """大负载长稳：250 次，含 150k 点 voxelization。"""
+        errors = []
+        for i in range(1, 251):
+            try:
+                N = int(np.random.randint(10000, 150000))
+                nvox = _voxel_once(N, seed=i)
+                ok, msg = _voxel_check(nvox, f"large_loop i={i}")
+                if not ok:
+                    errors.append((i, msg))
+            except Exception as e:
+                errors.append((i, str(e)[:80]))
+            if i % 100 == 0:
+                gc.collect()
+                torch.npu.synchronize()
+                torch.npu.empty_cache()
+        assert not errors, f"voxelization 大负载长稳压测失败：{len(errors)} 个错误, 前5: {errors[:5]}"
+
+
+if __name__ == "__main__":
+    t0 = time.perf_counter()
+    TestVoxelizationStability().test_small_loop()
+    TestVoxelizationStability().test_large_loop()
+    print(f"voxelization 长稳压测全部通过, 总耗时 {time.perf_counter() - t0:.0f}s")

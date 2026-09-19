@@ -1,10 +1,14 @@
 import torch
-import torch.nn as nn
+from torch import nn
 
 from .conv import (
-    SparseConv3d, SubMConv3d, SparseInverseConv3d,
-    SparseConv2d, SubMConv2d, SparseInverseConv2d,
+    SparseConv2d,
+    SparseConv3d,
     SparseConvolution,
+    SparseInverseConv2d,
+    SparseInverseConv3d,
+    SubMConv2d,
+    SubMConv3d,
 )
 
 # 兼容旧名

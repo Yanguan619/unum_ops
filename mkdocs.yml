@@ -1,0 +1,9 @@
+site_name: unum_ops
+site_description: 算子集合 + 纯 torch/numpy 跨硬件实现 + AscendC 算子
+
+nav:
+  - 首页: index.md
+  - 310P 接口支持矩阵: support_matrix.md
+
+markdown_extensions:
+  - tables

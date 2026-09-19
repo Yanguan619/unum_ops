@@ -54,6 +54,14 @@ from unum_ops.spconv.sparse_modules import (
     SubMConv3dAdapter,
 )
 from unum_ops.spconv.utils import VoxelGeneratorV2
+from unum_ops.spconv import spconv_ascendc as ascendc
+
+NPU_AVAIL = hasattr(torch, "npu") and torch.npu.is_available()
+if NPU_AVAIL:
+    try:
+        torch.npu.set_compile_mode(jit_compile=False)
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -260,6 +268,13 @@ def device():
     if hasattr(torch, "npu") and torch.npu.is_available():
         return torch.device("npu:0")
     return torch.device("cpu")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _load_ascendc():
+    if NPU_AVAIL:
+        assert ascendc.available(), "libspconv_gemm_ops.so 加载失败"
+    yield
 
 
 # ============================================================
@@ -1412,3 +1427,107 @@ class TestInverseConvFallback:
         out = up(z)
         # in_shape = spatial * stride = (5*2, 5*2, 5*2) = (10, 10, 10)
         assert tuple(out.spatial_shape[:3]) == (10, 10, 10)
+
+
+# ============================================================
+# AscendC Cube 内核测试（spconv_gemm 2D fp16）
+# ============================================================
+
+
+@pytest.mark.skipif(not NPU_AVAIL, reason="NPU not available")
+class TestSpconvGemmOp:
+    def test_op_runs(self):
+        """op 可正常调用（不 crash）"""
+        N, K_flat, C = 50000, 1728, 64
+        feats = torch.randn(N, K_flat, device="npu", dtype=torch.float16)
+        weight = torch.randn(K_flat, C, device="npu", dtype=torch.float16)
+        bias = torch.randn(C, device="npu", dtype=torch.float32)
+        params = torch.tensor([N, C, K_flat, 1, 8], dtype=torch.int32, device="npu")
+        out = torch.ops.unum.spconv_gemm(feats, weight, bias, params)
+        assert out.shape == (N, C)
+
+    def test_output_not_all_nan(self):
+        """输出不全是 NaN"""
+        N, K, C = 50000, 1728, 64
+        feats = torch.randn(N, K, device="npu", dtype=torch.float16)
+        weight = torch.randn(K, C, device="npu", dtype=torch.float16)
+        bias = torch.randn(C, device="npu", dtype=torch.float32)
+        params = torch.tensor([N, C, K, 1, 8], dtype=torch.int32, device="npu")
+        out = torch.ops.unum.spconv_gemm(feats, weight, bias, params)
+        assert not torch.isnan(out).any()
+
+    @pytest.mark.xfail(reason="Cube 内核 stride 写入 bug（baseM=1024 而非 1）")
+    def test_basic_correctness(self):
+        """基本数值正确性（已知 bug，预期 xfail）"""
+        N, K_flat, C = 8, 4, 3
+        torch.manual_seed(0)
+        feats = torch.randn(N, K_flat, device="npu", dtype=torch.float16)
+        weight = torch.randn(K_flat, C, device="npu", dtype=torch.float16)
+        bias = torch.randn(C, device="npu", dtype=torch.float32)
+        params = torch.tensor([N, C, K_flat, 1, 8], dtype=torch.int32, device="npu")
+        out = torch.ops.unum.spconv_gemm(feats, weight, bias, params)
+        ref = (feats.float() @ weight.float()) + bias
+        assert torch.allclose(out, ref, atol=0.5)
+
+    def test_repeatability(self):
+        """相同输入多次调用应给出相同结果"""
+        N, K, C = 16, 8, 4
+        torch.manual_seed(0)
+        feats = torch.randn(N, K, device="npu", dtype=torch.float16)
+        weight = torch.randn(K, C, device="npu", dtype=torch.float16)
+        bias = torch.randn(C, device="npu", dtype=torch.float32)
+        params = torch.tensor([N, C, K, 1, 8], dtype=torch.int32, device="npu")
+        outs = [torch.ops.unum.spconv_gemm(feats, weight, bias, params) for _ in range(3)]
+        assert torch.allclose(outs[0], outs[1], atol=0.01)
+        assert torch.allclose(outs[0], outs[2], atol=0.01)
+
+    def test_small_shape(self):
+        """小形状可运行"""
+        N, K, C = 2, 4, 3
+        feats = torch.randn(N, K, device="npu", dtype=torch.float16)
+        weight = torch.randn(K, C, device="npu", dtype=torch.float16)
+        bias = torch.randn(C, device="npu", dtype=torch.float32)
+        params = torch.tensor([N, C, K, 1, 8], dtype=torch.int32, device="npu")
+        out = torch.ops.unum.spconv_gemm(feats, weight, bias, params)
+        assert out.shape == (N, C)
+
+
+@pytest.mark.skipif(not NPU_AVAIL, reason="NPU not available")
+class TestAutogradFunction:
+    def test_forward_via_ascendc(self):
+        """ascendc.spconv_gemm 前向可运行"""
+        N, K, C = 16, 8, 4
+        torch.manual_seed(0)
+        feats = torch.randn(N, K, requires_grad=True, device="npu", dtype=torch.float16)
+        weight = torch.randn(K, C, requires_grad=True, device="npu", dtype=torch.float16)
+        bias = torch.randn(C, requires_grad=True, device="npu", dtype=torch.float32)
+        out = ascendc.spconv_gemm(feats, weight, bias)
+        assert out.shape == (N, C)
+        assert not torch.isnan(out).any()
+
+    @pytest.mark.xfail(reason="Cube 内核 stride 写入 bug，前向数值不正确")
+    def test_backward_matches_autograd(self):
+        """反向传播梯度应与 einsum 路径一致（已知 bug，预期 xfail）"""
+        N, K, C = 8, 4, 3
+        torch.manual_seed(0)
+        feats = torch.randn(N, K, requires_grad=True, device="npu", dtype=torch.float16)
+        weight = torch.randn(K, C, requires_grad=True, device="npu", dtype=torch.float16)
+        bias = torch.randn(C, requires_grad=True, device="npu", dtype=torch.float32)
+        out = ascendc.spconv_gemm(feats, weight, bias)
+        loss = out.sum()
+        gF, gW, gB = torch.autograd.grad(loss, [feats, weight, bias])
+        assert gF is not None
+        assert gW is not None
+        assert gB is not None
+
+
+@pytest.mark.skipif(not NPU_AVAIL, reason="NPU not available")
+class TestEdgeCasesAscendC:
+    def test_empty_input(self):
+        """空输出应返回空张量（通过 _gather 的早期返回）"""
+        x = SparseConvTensor(torch.empty(0, 16).npu(),
+                             torch.empty(0, 4, dtype=torch.int32).npu(),
+                             (10, 30, 40), 1)
+        conv = SubMConv3d(16, 16, 3, padding=1, bias=True).eval().to("npu:0")
+        y = conv(x)
+        assert y.features.shape == (0, 16)

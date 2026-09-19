@@ -2,17 +2,20 @@ import hashlib
 import itertools
 import os
 
-import torch
-import torch.nn as nn
 import numpy as np
-from typing import Optional, Tuple, Union
+import torch
+from torch import nn
 
+from . import spconv_ascendc as ascendc
 from .sparse_modules import SparseConvTensor, SparseModule
-from . import ascendc
 
 # AscendC 内核默认关闭（标量实现慢于 torch 2D GEMM），显式开启用环境变量
-_USE_ASCENDC = os.environ.get("UNUM_SPCONV_USE_ASCENDC", "").strip().lower() \
-    in ("1", "true", "yes", "on")
+_USE_ASCENDC = os.environ.get("UNUM_SPCONV_USE_ASCENDC", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 # 邻居查找稠密网格上限（int64 条目数）：超过后回退到 sort+searchsorted。
 # 8M 条目 = 64MB，覆盖 BEVFusion 常用空间 (200,200,16)=640K / SECOND (100,100,8)=80K。
@@ -44,16 +47,18 @@ class SparseConvolution(SparseModule):
       - _gather 中 neighbor_idx 已与 features 同设备，无需再 .to(device)
     """
 
-    def __init__(self,
-                 in_channels: int,
-                 out_channels: int,
-                 kernel_size: Union[int, Tuple[int, ...]],
-                 stride: Union[int, Tuple[int, ...]] = 1,
-                 padding: Union[int, Tuple[int, ...]] = 0,
-                 dilation: Union[int, Tuple[int, ...]] = 1,
-                 bias: bool = True,
-                 indice_key: Optional[str] = None,
-                 ndim: int = 3):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int | tuple[int, ...],
+        stride: int | tuple[int, ...] = 1,
+        padding: int | tuple[int, ...] = 0,
+        dilation: int | tuple[int, ...] = 1,
+        bias: bool = True,
+        indice_key: str | None = None,
+        ndim: int = 3,
+    ):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -67,18 +72,18 @@ class SparseConvolution(SparseModule):
         self.weight = nn.Parameter(
             torch.empty(out_channels, in_channels, *self.kernel_size)
         )
-        nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
+        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_channels))
         else:
-            self.register_parameter('bias', None)
+            self.register_parameter("bias", None)
 
         # 惰性缓存
         self._offsets_cache = None
         self._offsets_ndim = None
         self._nb_cache = {}
 
-    def _triple(self, x, ndim=None) -> Tuple[int, ...]:
+    def _triple(self, x, ndim=None) -> tuple[int, ...]:
         if ndim is None:
             ndim = self.ndim
         if isinstance(x, (tuple, list)):
@@ -111,7 +116,7 @@ class SparseConvolution(SparseModule):
         """
         if self._offsets_cache is None or self._offsets_ndim != self.ndim:
             prod = self._kernel_offsets()
-            offs = [p[:self.ndim] for p in prod]
+            offs = [p[: self.ndim] for p in prod]
             self._offsets_cache = torch.tensor(offs, dtype=torch.int64)
             self._offsets_ndim = self.ndim
         return self._offsets_cache
@@ -139,13 +144,15 @@ class SparseConvolution(SparseModule):
         （load_state_dict 等），data_ptr 覆盖 .data 整体替换（cast_to_fp16）。
         """
         key = (self.weight._version, self.weight.data_ptr())
-        cache = self.__dict__.get('_wT2d_cache')
+        cache = self.__dict__.get("_wT2d_cache")
         if cache is None or cache[0] != key:
             K = self._offsets_t.shape[0]
             w = self.weight.reshape(self.out_channels, self.in_channels, K)
-            wT = w.permute(2, 1, 0).contiguous()      # (K, C_in, C_out)
-            self._wT2d_cache = (key, wT.reshape(K * self.in_channels,
-                                                self.out_channels))
+            wT = w.permute(2, 1, 0).contiguous()  # (K, C_in, C_out)
+            self._wT2d_cache = (
+                key,
+                wT.reshape(K * self.in_channels, self.out_channels),
+            )
         return self._wT2d_cache[1]
 
     # ------------------------------------------------------------------
@@ -174,8 +181,13 @@ class SparseConvolution(SparseModule):
             keys = keys + inds[:, d + 1] * strides_t[d + 1]
         return keys
 
-    def _lookup_grid(self, in_keys: torch.Tensor, cand_keys: torch.Tensor,
-                     cand_valid: torch.Tensor, max_key: int) -> torch.Tensor:
+    def _lookup_grid(
+        self,
+        in_keys: torch.Tensor,
+        cand_keys: torch.Tensor,
+        cand_valid: torch.Tensor,
+        max_key: int,
+    ) -> torch.Tensor:
         """稠密网格 O(1) 查找：in_keys 与 cand_keys 已在同一 key 空间。
 
         max_key: 网格分配大小下界（>= batch_size*sp_total）。
@@ -198,8 +210,13 @@ class SparseConvolution(SparseModule):
             return torch.where(cand_valid, nb, torch.full_like(nb, -1))
         return None
 
-    def _lookup(self, in_indices: torch.Tensor, spatial_shape,
-                cand_keys: torch.Tensor, cand_valid: torch.Tensor) -> torch.Tensor:
+    def _lookup(
+        self,
+        in_indices: torch.Tensor,
+        spatial_shape: tuple[int, ...],
+        cand_keys: torch.Tensor,
+        cand_valid: torch.Tensor,
+    ) -> torch.Tensor:
         """批量查找候选坐标对应的输入行索引；未命中置 -1。
         全程在 cand_keys 所在设备完成。
 
@@ -247,9 +264,16 @@ class SparseConvolution(SparseModule):
         match = (in_keys_sorted[pos] == cand_keys.double()) & cand_valid
         return torch.where(match, order[pos], torch.full_like(pos, -1))
 
-    def _build_neighbor_idx(self, in_indices: torch.Tensor, out_coords: torch.Tensor,
-                            spatial_shape, kernel, padding, stride,
-                            dilation=None) -> torch.Tensor:
+    def _build_neighbor_idx(
+        self,
+        in_indices: torch.Tensor,
+        out_coords: torch.Tensor,
+        spatial_shape,
+        kernel,
+        padding,
+        stride,
+        dilation=None,
+    ) -> torch.Tensor:
         """普通（SubM / 步长）卷积邻居表。
 
         对每个输出坐标 q 与每个核偏移 k：候选输入坐标 = q*stride + k*dilation - padding，
@@ -268,21 +292,34 @@ class SparseConvolution(SparseModule):
         N_out = out_coords.shape[0]
         sp_col = torch.tensor(
             [int(spatial_shape[i]) for i in range(ndim)],
-            dtype=torch.int64, device=device,
+            dtype=torch.int64,
+            device=device,
         )
-        pad = torch.tensor([int(p) for p in padding[:ndim]], dtype=torch.int64, device=device)
-        st = torch.tensor([int(s) for s in stride[:ndim]], dtype=torch.int64, device=device)
-        dil = torch.tensor([int(d) for d in dilation[:ndim]], dtype=torch.int64, device=device) \
-            if dilation is not None else torch.ones(ndim, dtype=torch.int64, device=device)
+        pad = torch.tensor(
+            [int(p) for p in padding[:ndim]], dtype=torch.int64, device=device
+        )
+        st = torch.tensor(
+            [int(s) for s in stride[:ndim]], dtype=torch.int64, device=device
+        )
+        dil = (
+            torch.tensor(
+                [int(d) for d in dilation[:ndim]], dtype=torch.int64, device=device
+            )
+            if dilation is not None
+            else torch.ones(ndim, dtype=torch.int64, device=device)
+        )
         if N_out == 0:
             return torch.empty(0, K, dtype=torch.int64, device=device)
 
         oc = out_coords
-        cand_sp = oc[:, None, 1:] * st + offs[None] * dil - pad   # (N_out, K, ndim) 列序 [x,y,z]
+        cand_sp = (
+            oc[:, None, 1:] * st + offs[None] * dil - pad
+        )  # (N_out, K, ndim) 列序 [x,y,z]
         # SubM 快速路径：in_indices 与 out_coords 同一数据（stride=1 下采样不变）
-        if (in_indices.data_ptr() == out_coords.data_ptr()
-                and all(int(s) == 1 for s in stride[:ndim])):
-            in_keys = self._encode(in_indices, spatial_shape)          # (N,)
+        if in_indices.data_ptr() == out_coords.data_ptr() and all(
+            int(s) == 1 for s in stride[:ndim]
+        ):
+            in_keys = self._encode(in_indices, spatial_shape)  # (N,)
             # 偏移量在 key 空间：offs*strides[1:] - padding*strides[1:]
             sp_strides = [1] * (ndim + 1)
             acc = 1
@@ -291,10 +328,15 @@ class SparseConvolution(SparseModule):
                 acc *= int(spatial_shape[j - 1])
             sp_strides[0] = acc
             sp_total = acc
-            offs_key = (offs * dil * torch.tensor(
-                sp_strides[1:], dtype=torch.int64, device=device)).sum(-1)
-            pad_key = (pad * torch.tensor(sp_strides[1:], dtype=torch.int64, device=device)).sum(-1)
-            cand_keys = in_keys[:, None] + (offs_key - pad_key)[None, :]   # (N, K)
+            offs_key = (
+                offs
+                * dil
+                * torch.tensor(sp_strides[1:], dtype=torch.int64, device=device)
+            ).sum(-1)
+            pad_key = (
+                pad * torch.tensor(sp_strides[1:], dtype=torch.int64, device=device)
+            ).sum(-1)
+            cand_keys = in_keys[:, None] + (offs_key - pad_key)[None, :]  # (N, K)
 
             # 边界：核窗口内的邻居落在 [0, sp) 内才算有效
             in_range = (cand_sp >= 0) & (cand_sp < sp_col)
@@ -316,9 +358,16 @@ class SparseConvolution(SparseModule):
         cand_keys = torch.where(valid, cand_keys, torch.zeros_like(cand_keys))
         return self._lookup(in_indices, spatial_shape, cand_keys, valid)
 
-    def _build_inverse_neighbor_idx(self, out_coords: torch.Tensor, in_indices: torch.Tensor,
-                                    spatial_shape, kernel, padding, stride,
-                                    dilation=None) -> torch.Tensor:
+    def _build_inverse_neighbor_idx(
+        self,
+        out_coords: torch.Tensor,
+        in_indices: torch.Tensor,
+        spatial_shape,
+        kernel,
+        padding,
+        stride,
+        dilation=None,
+    ) -> torch.Tensor:
         """转置卷积邻居表。
 
         对每个细坐标 c 与核偏移 k：粗坐标 q = (c + padding - k*dilation) / stride（仅当整除且落在范围内）。
@@ -332,17 +381,27 @@ class SparseConvolution(SparseModule):
         N_out = out_coords.shape[0]
         sp_col = torch.tensor(
             [int(spatial_shape[i]) for i in range(ndim)],
-            dtype=torch.int64, device=device,
+            dtype=torch.int64,
+            device=device,
         )
-        pad = torch.tensor([int(p) for p in padding[:ndim]], dtype=torch.int64, device=device)
-        st = torch.tensor([int(s) for s in stride[:ndim]], dtype=torch.int64, device=device)
-        dil = torch.tensor([int(d) for d in dilation[:ndim]], dtype=torch.int64, device=device) \
-            if dilation is not None else torch.ones(ndim, dtype=torch.int64, device=device)
+        pad = torch.tensor(
+            [int(p) for p in padding[:ndim]], dtype=torch.int64, device=device
+        )
+        st = torch.tensor(
+            [int(s) for s in stride[:ndim]], dtype=torch.int64, device=device
+        )
+        dil = (
+            torch.tensor(
+                [int(d) for d in dilation[:ndim]], dtype=torch.int64, device=device
+            )
+            if dilation is not None
+            else torch.ones(ndim, dtype=torch.int64, device=device)
+        )
         if N_out == 0:
             return torch.empty(0, K, dtype=torch.int64, device=device)
 
         oc = out_coords
-        num = oc[:, None, 1:] + pad - offs[None] * dil            # c + padding - k*dilation
+        num = oc[:, None, 1:] + pad - offs[None] * dil  # c + padding - k*dilation
         q = num // st
         div = (num % st) == 0
         in_range = (q >= 0) & (q < sp_col)
@@ -357,7 +416,11 @@ class SparseConvolution(SparseModule):
     # 特征聚合（批量 GEMM）
     # ------------------------------------------------------------------
 
-    def _gather(self, features: torch.Tensor, neighbor_idx: torch.Tensor) -> torch.Tensor:
+    def _gather(
+        self,
+        features: torch.Tensor,
+        neighbor_idx: torch.Tensor,
+    ) -> torch.Tensor:
         """out[n] = bias + sum_k wT[k] @ features[neighbor_idx[n,k]]（邻居缺失贡献为 0）
 
         neighbor_idx 必须与 features 同设备（由上层 _neighbor_cached 保证）。
@@ -374,19 +437,18 @@ class SparseConvolution(SparseModule):
             return features.new_zeros(0, C_out)
 
         # 1. 展平邻居索引，一次性 gather 所有邻居特征
-        nb_flat = neighbor_idx.reshape(-1)               # (N*K,)
-        valid = nb_flat >= 0                              # (N*K,)
-        nb_safe = nb_flat.clamp(min=0)                   # 无效位置暂时指向第 0 行
+        nb_flat = neighbor_idx.reshape(-1)  # (N*K,)
+        valid = nb_flat >= 0  # (N*K,)
+        nb_safe = nb_flat.clamp(min=0)  # 无效位置暂时指向第 0 行
         all_feats = torch.index_select(features, 0, nb_safe)  # (N*K, C_in)
         # 无效邻居置零（不影响累加）
         all_feats = all_feats * valid.unsqueeze(-1).to(dtype=features.dtype)
-        all_feats = all_feats.reshape(N, K, C_in)       # (N, K, C_in)
+        all_feats = all_feats.reshape(N, K, C_in)  # (N, K, C_in)
 
         # 2. AscendC 加速路径（仅 NPU + 扩展可加载 + 显式启用时）
         # Cube 内核：fp16 (N, K*C_in) @ fp16 (K*C_in, C_out) → fp32 (N, C_out)。
         # 默认走 torch 2D GEMM；设置环境变量 UNUM_SPCONV_USE_ASCENDC=1 启用内核。
-        if (features.device.type == 'npu' and _USE_ASCENDC
-                and ascendc.available()):
+        if features.device.type == "npu" and _USE_ASCENDC and ascendc.available():
             feats_l = all_feats.reshape(N, K * C_in).to(torch.float16)
             w_l = self._wT2d.to(torch.float16)
             if self.bias is not None:
@@ -419,10 +481,10 @@ class SparseConvolution(SparseModule):
         if torch.jit.is_tracing():
             # 导出期间：每个 _fingerprint 调用返回唯一标识，确保 _neighbor_cached
             # 必然 miss、每层独立 build 邻居表
-            if not hasattr(self, '_trace_fp_counter'):
+            if not hasattr(self, "_trace_fp_counter"):
                 self._trace_fp_counter = 0
             self._trace_fp_counter += 1
-            return f'trace_fp_{id(self)}_{self._trace_fp_counter}'
+            return f"trace_fp_{id(self)}_{self._trace_fp_counter}"
         h = hashlib.md5()
         for p in parts:
             if torch.is_tensor(p):
@@ -443,7 +505,7 @@ class SparseConvolution(SparseModule):
         - device=None 表示与 build 返回值同设备（向后兼容）
         - 命中后无设备往返：缓存的就是目标设备上的 nb
         """
-        key = (fp, str(device) if device is not None else 'cpu')
+        key = (fp, str(device) if device is not None else "cpu")
         nb = self._nb_cache.get(key)
         if nb is None:
             nb = build()
@@ -477,10 +539,9 @@ class SparseConvolution(SparseModule):
         for d in range(ndim):
             c = inds[:, d + 1]
             lo = torch.ceil(
-                (c + self.padding[d] - self.kernel_size[d] + 1).float()
-                / self.stride[d]).long()
-            hi = torch.floor(
-                (c + self.padding[d]).float() / self.stride[d]).long()
+                (c + self.padding[d] - self.kernel_size[d] + 1).float() / self.stride[d]
+            ).long()
+            hi = torch.floor((c + self.padding[d]).float() / self.stride[d]).long()
             n = (hi - lo + 1).clamp_min(0)
             los.append(lo)
             ns.append(n)
@@ -500,8 +561,7 @@ class SparseConvolution(SparseModule):
         T = torch.index_select(totals, 0, keep_idx)
 
         # 展开行：第 r 行重复 T[r] 次
-        base = torch.repeat_interleave(
-            torch.arange(Nk, device=device), T)
+        base = torch.repeat_interleave(torch.arange(Nk, device=device), T)
         # 行内序号 rem = 全局序号 - 该行起始（exclusive 前缀和）
         csum = torch.cumsum(T, 0)
         starts = csum - T
@@ -518,8 +578,7 @@ class SparseConvolution(SparseModule):
                 r = r // div
             else:
                 cds[d] = r
-        cols = [batch_kept[base]] + [los[d][base] + cds[d]
-                                     for d in range(ndim)]
+        cols = [batch_kept[base]] + [los[d][base] + cds[d] for d in range(ndim)]
         return torch.stack(cols, dim=1)
 
     def forward(self, x: SparseConvTensor) -> SparseConvTensor:
@@ -527,12 +586,29 @@ class SparseConvolution(SparseModule):
 
 
 class SubMConv3d(SparseConvolution):
-    def __init__(self, in_channels, out_channels, kernel_size,
-                 stride=1, padding=0, dilation=1, bias=True, indice_key=None,
-                 ndim=3):
-        super().__init__(in_channels, out_channels, kernel_size,
-                         stride=stride, padding=padding, dilation=dilation,
-                         bias=bias, indice_key=indice_key, ndim=ndim)
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+        bias=True,
+        indice_key=None,
+        ndim=3,
+    ):
+        super().__init__(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            bias=bias,
+            indice_key=indice_key,
+            ndim=ndim,
+        )
 
     def forward(self, x: SparseConvTensor) -> SparseConvTensor:
         features, indices = x.features, x.indices
@@ -546,63 +622,112 @@ class SubMConv3d(SparseConvolution):
         # （~0.12s/层 @ 1.7 万体素）。缓存挂在 tensor 上随前向传播、每帧新建。
         # coords 以 data_ptr 入 key：同 key 层在 encoder/decoder 侧可能对应
         # 不同 coords（inverse 上采样后），此时必须分开构建。
-        cache = getattr(x, '_layer_nb_cache', None)
-        lparams = (('subm',) + tuple(self.kernel_size) + tuple(self.padding)
-                   + tuple(self.stride) + tuple(self.dilation) + spatial
-                   + (indices.shape[0], indices.data_ptr(), str(device)))
+        cache = getattr(x, "_layer_nb_cache", None)
+        lparams = (
+            ("subm",)
+            + tuple(self.kernel_size)
+            + tuple(self.padding)
+            + tuple(self.stride)
+            + tuple(self.dilation)
+            + spatial
+            + (indices.shape[0], indices.data_ptr(), str(device))
+        )
         nb = cache.get(lparams) if cache is not None else None
 
         if nb is None:
+
             def build():
                 # 不再 .cpu()，全程留在 features 设备
                 in_c = indices.long().to(device).contiguous()
                 return self._build_neighbor_idx(
-                    in_c, in_c, spatial,
-                    self.kernel_size, self.padding, self.stride, self.dilation,
+                    in_c,
+                    in_c,
+                    spatial,
+                    self.kernel_size,
+                    self.padding,
+                    self.stride,
+                    self.dilation,
                 )
 
-            fp = self._fingerprint(indices, ('subm', self.kernel_size, self.padding,
-                                             self.stride, spatial))
+            fp = self._fingerprint(
+                indices, ("subm", self.kernel_size, self.padding, self.stride, spatial)
+            )
             nb = self._neighbor_cached(fp, build, device)
             if cache is not None:
                 cache[lparams] = nb
         out_feat = self._gather(features, nb)
-        out = SparseConvTensor(out_feat, indices, x.spatial_shape, x.batch_size,
-                               grid=x.grid)
+        out = SparseConvTensor(
+            out_feat, indices, x.spatial_shape, x.batch_size, grid=x.grid
+        )
         out.indice_dict = dict(x.indice_dict)
         out._layer_nb_cache = getattr(x, "_layer_nb_cache", {})
         if self.indice_key is not None:
             out.indice_dict[self.indice_key] = {
-                'in_coords': indices.clone(),
-                'stride': tuple(self.stride),
-                'padding': tuple(self.padding),
-                'dilation': tuple(self.dilation),
-                'kernel': tuple(self.kernel_size),
+                "in_coords": indices.clone(),
+                "stride": tuple(self.stride),
+                "padding": tuple(self.padding),
+                "dilation": tuple(self.dilation),
+                "kernel": tuple(self.kernel_size),
             }
         return out
 
 
 class SubMConv2d(SubMConv3d):
-    def __init__(self, in_channels, out_channels, kernel_size,
-                 stride=1, padding=0, dilation=1, bias=True, indice_key=None):
-        super().__init__(in_channels, out_channels, kernel_size,
-                         stride=stride, padding=padding, dilation=dilation,
-                         bias=bias, indice_key=indice_key, ndim=2)
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+        bias=True,
+        indice_key=None,
+    ):
+        super().__init__(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            bias=bias,
+            indice_key=indice_key,
+            ndim=2,
+        )
 
 
 class SparseConv3d(SparseConvolution):
-    def __init__(self, in_channels, out_channels, kernel_size,
-                 stride=1, padding=0, dilation=1, bias=True, indice_key=None,
-                 ndim=3):
-        super().__init__(in_channels, out_channels, kernel_size,
-                         stride=stride, padding=padding, dilation=dilation,
-                         bias=bias, indice_key=indice_key, ndim=ndim)
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+        bias=True,
+        indice_key=None,
+        ndim=3,
+    ):
+        super().__init__(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            bias=bias,
+            indice_key=indice_key,
+            ndim=ndim,
+        )
 
     def forward(self, x: SparseConvTensor) -> SparseConvTensor:
         features, indices = x.features, x.indices
-        in_shape = tuple(x.spatial_shape[:self.ndim])
+        in_shape = tuple(x.spatial_shape[: self.ndim])
         out_shape = tuple(
-            (s + 2 * self.padding[d] - (self.kernel_size[d] - 1) - 1) // self.stride[d] + 1
+            (s + 2 * self.padding[d] - (self.kernel_size[d] - 1) - 1) // self.stride[d]
+            + 1
             for d, s in enumerate(in_shape)
         )
         device = features.device
@@ -622,46 +747,78 @@ class SparseConv3d(SparseConvolution):
                 keys = self._encode(out_i, out_shape).double()
                 order = torch.topk(keys, k=keys.size(0), largest=False).indices
                 sk = keys[order]
-                is_first = torch.cat([
-                    torch.ones(1, dtype=torch.bool, device=device),
-                    sk[1:] != sk[:-1]])
+                is_first = torch.cat(
+                    [torch.ones(1, dtype=torch.bool, device=device), sk[1:] != sk[:-1]]
+                )
                 first_idx = torch.nonzero(is_first).flatten()
                 sorted_out = torch.index_select(out_i, 0, order)
                 out_i = torch.index_select(sorted_out, 0, first_idx)
             nb = self._build_neighbor_idx(
-                in_c, out_i, in_shape,
-                self.kernel_size, self.padding, self.stride, self.dilation,
+                in_c,
+                out_i,
+                in_shape,
+                self.kernel_size,
+                self.padding,
+                self.stride,
+                self.dilation,
             )
             return nb, out_i
 
-        fp = self._fingerprint(indices, ('sparse', self.kernel_size, self.padding,
-                                         self.stride, in_shape, out_shape))
+        fp = self._fingerprint(
+            indices,
+            (
+                "sparse",
+                self.kernel_size,
+                self.padding,
+                self.stride,
+                in_shape,
+                out_shape,
+            ),
+        )
         nb, out_indices = self._neighbor_cached(fp, build, device)
         out_feat = self._gather(features, nb)
 
-        spatial_shape = list(out_shape) + list(x.spatial_shape[self.ndim:])
-        out = SparseConvTensor(out_feat, out_indices, spatial_shape, x.batch_size,
-                               grid=x.grid)
+        spatial_shape = list(out_shape) + list(x.spatial_shape[self.ndim :])
+        out = SparseConvTensor(
+            out_feat, out_indices, spatial_shape, x.batch_size, grid=x.grid
+        )
         out.indice_dict = dict(x.indice_dict)
         out._layer_nb_cache = getattr(x, "_layer_nb_cache", {})
         if self.indice_key is not None:
             out.indice_dict[self.indice_key] = {
-                'in_coords': indices.clone(),
-                'in_shape': list(in_shape),
-                'stride': tuple(self.stride),
-                'padding': tuple(self.padding),
-                'dilation': tuple(self.dilation),
-                'kernel': tuple(self.kernel_size),
+                "in_coords": indices.clone(),
+                "in_shape": list(in_shape),
+                "stride": tuple(self.stride),
+                "padding": tuple(self.padding),
+                "dilation": tuple(self.dilation),
+                "kernel": tuple(self.kernel_size),
             }
         return out
 
 
 class SparseConv2d(SparseConv3d):
-    def __init__(self, in_channels, out_channels, kernel_size,
-                 stride=1, padding=0, dilation=1, bias=True, indice_key=None):
-        super().__init__(in_channels, out_channels, kernel_size,
-                         stride=stride, padding=padding, dilation=dilation,
-                         bias=bias, indice_key=indice_key, ndim=2)
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+        bias=True,
+        indice_key=None,
+    ):
+        super().__init__(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            bias=bias,
+            indice_key=indice_key,
+            ndim=2,
+        )
 
 
 class SparseInverseConv3d(SparseConvolution):
@@ -671,22 +828,30 @@ class SparseInverseConv3d(SparseConvolution):
     输出坐标 = 下采样前的输入坐标（由输入 tensor 携带的 indice_dict 提供）。
     """
 
-    def __init__(self, in_channels, out_channels, kernel_size,
-                 indice_key=None, bias=True, ndim=3):
-        super().__init__(in_channels, out_channels, kernel_size,
-                         stride=1, padding=0, bias=bias,
-                         indice_key=indice_key, ndim=ndim)
+    def __init__(
+        self, in_channels, out_channels, kernel_size, indice_key=None, bias=True, ndim=3
+    ):
+        super().__init__(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=1,
+            padding=0,
+            bias=bias,
+            indice_key=indice_key,
+            ndim=ndim,
+        )
 
     def forward(self, x: SparseConvTensor) -> SparseConvTensor:
         key = self.indice_key
         # 读取配对下采样卷积记录的 fine coords 与参数
         if key is not None and key in x.indice_dict:
             info = x.indice_dict[key]
-            out_indices = info['in_coords']
-            stride = tuple(info['stride'])
-            padding = tuple(info['padding'])
-            dilation = tuple(info.get('dilation', (1,) * self.ndim))
-            kernel = tuple(info['kernel'])
+            out_indices = info["in_coords"]
+            stride = tuple(info["stride"])
+            padding = tuple(info["padding"])
+            dilation = tuple(info.get("dilation", (1,) * self.ndim))
+            kernel = tuple(info["kernel"])
         else:
             raise ValueError(
                 f"SparseInverseConv3d requires matching SparseConv3d with indice_key='{key}' "
@@ -694,43 +859,74 @@ class SparseInverseConv3d(SparseConvolution):
             )
 
         features = x.features
-        in_shape = tuple(x.spatial_shape[:self.ndim])
+        in_shape = tuple(x.spatial_shape[: self.ndim])
         device = features.device
 
         # 帧内跨层共享（同 key 的 inverse 层作用相同 fine/coarse coords 对）
-        cache = getattr(x, '_layer_nb_cache', None)
-        lparams = (('inv',) + kernel + padding + stride + dilation + in_shape
-                   + (out_indices.shape[0], out_indices.data_ptr(),
-                      x.indices.shape[0], x.indices.data_ptr(), str(device)))
+        cache = getattr(x, "_layer_nb_cache", None)
+        lparams = (
+            ("inv",)
+            + kernel
+            + padding
+            + stride
+            + dilation
+            + in_shape
+            + (
+                out_indices.shape[0],
+                out_indices.data_ptr(),
+                x.indices.shape[0],
+                x.indices.data_ptr(),
+                str(device),
+            )
+        )
         nb = cache.get(lparams) if cache is not None else None
 
         if nb is None:
+
             def build():
                 # 不再 .cpu()，全程留在 features 设备
                 fine_c = out_indices.long().to(device).contiguous()
                 coarse_c = x.indices.long().to(device).contiguous()
                 return self._build_inverse_neighbor_idx(
-                    fine_c, coarse_c, in_shape, kernel, padding, stride, dilation,
+                    fine_c,
+                    coarse_c,
+                    in_shape,
+                    kernel,
+                    padding,
+                    stride,
+                    dilation,
                 )
 
-            fp = self._fingerprint(out_indices, x.indices,
-                                   ('inverse', kernel, padding, stride, dilation, in_shape))
+            fp = self._fingerprint(
+                out_indices,
+                x.indices,
+                ("inverse", kernel, padding, stride, dilation, in_shape),
+            )
             nb = self._neighbor_cached(fp, build, device)
             if cache is not None:
                 cache[lparams] = nb
         out = self._gather(features, nb)
 
-        spatial_shape = list(info.get('in_shape',
-                                      tuple(s * st for s, st in zip(in_shape, stride))))
-        out_t = SparseConvTensor(out, out_indices, spatial_shape, x.batch_size,
-                                 grid=x.grid)
+        spatial_shape = list(
+            info.get("in_shape", tuple(s * st for s, st in zip(in_shape, stride)))
+        )
+        out_t = SparseConvTensor(
+            out, out_indices, spatial_shape, x.batch_size, grid=x.grid
+        )
         out_t._layer_nb_cache = getattr(x, "_layer_nb_cache", {})
         return out_t
 
 
 class SparseInverseConv2d(SparseInverseConv3d):
-    def __init__(self, in_channels, out_channels, kernel_size,
-                 indice_key=None, bias=True):
-        super().__init__(in_channels, out_channels, kernel_size,
-                         indice_key=indice_key, bias=bias, ndim=2)
+    def __init__(
+        self, in_channels, out_channels, kernel_size, indice_key=None, bias=True
+    ):
+        super().__init__(
+            in_channels,
+            out_channels,
+            kernel_size,
+            indice_key=indice_key,
+            bias=bias,
+            ndim=2,
+        )
         self.ndim = 2

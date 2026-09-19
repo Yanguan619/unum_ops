@@ -1,3 +1,4 @@
+default_install_hook_types: [pre-commit, pre-push]
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.5.0
@@ -26,21 +27,33 @@ repos:
         args: [--fix, --disable, MD013, MD033, MD041, MD024, --]
   - repo: local
     hooks:
-      - id: pytest
-        name: pytest
+      - id: pytest-registry
+        name: pytest-registry (fast)
         entry: pytest
         language: system
         pass_filenames: false
-        args: ["test", "-x", "--tb=short"]
+        args: ["test/test_registry.py", "-x", "--tb=short"]
         always_run: true
         verbose: true
   - repo: local
     hooks:
       - id: pytest
-        name: pytest-benchmarking
+        name: pytest (full)
+        entry: pytest
+        language: system
+        pass_filenames: false
+        args: ["test", "-x", "--tb=short"]
+        stages: [pre-push]
+        always_run: true
+        verbose: true
+  - repo: local
+    hooks:
+      - id: pytest-benchmark
+        name: pytest-benchmark
         entry: pytest
         language: system
         pass_filenames: false
         args: ["benchmark", "-x", "--tb=short", "-sv"]
+        stages: [pre-push]
         always_run: true
         verbose: true

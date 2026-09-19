@@ -1,6 +1,7 @@
+from typing import Any
+
 import torch
-import torch.nn as nn
-from typing import List, Optional, Union, Dict, Any
+from torch import nn
 
 
 class SparseConvTensor:
@@ -9,12 +10,14 @@ class SparseConvTensor:
     封装稀疏体素数据：特征 + 坐标 + 空间形状
     """
 
-    def __init__(self,
-                 features: torch.Tensor,
-                 indices: torch.Tensor,
-                 spatial_shape,
-                 batch_size: int,
-                 grid: Optional[torch.Tensor] = None):
+    def __init__(
+        self,
+        features: torch.Tensor,
+        indices: torch.Tensor,
+        spatial_shape,
+        batch_size: int,
+        grid: torch.Tensor | None = None,
+    ):
         """
         Args:
             features: (N, C) 体素特征
@@ -30,7 +33,7 @@ class SparseConvTensor:
         self.batch_size = batch_size
         self.grid = grid
         # 记录是否有索引映射（用于 replace_feature / SparseInverseConv）
-        self._indice_dict: Dict[str, Any] = {}
+        self._indice_dict: dict[str, Any] = {}
         # 帧级邻居表缓存：同一帧前向传播中，同参数卷积层作用于相同 coords 时
         # 共享邻居表（官方 spconv 按 indice_key 共享 indice pairs 的等价物）。
         # 每次构造新 tensor 即新缓存——无跨帧陈旧数据风险；由各卷积层 forward
@@ -52,7 +55,7 @@ class SparseConvTensor:
 
     @property
     def spatial_size(self):
-        return self.spatial_shape[:self.ndim]
+        return self.spatial_shape[: self.ndim]
 
     @property
     def shape(self):
@@ -62,24 +65,25 @@ class SparseConvTensor:
     def replace_feature(self, features: torch.Tensor):
         """用新特征替换当前特征，保持其他属性不变"""
         out = SparseConvTensor(
-            features, self.indices, self.spatial_shape,
-            self.batch_size, self.grid
+            features, self.indices, self.spatial_shape, self.batch_size, self.grid
         )
         out.indice_dict = self.indice_dict
         out._layer_nb_cache = self._layer_nb_cache
         return out
 
     def dense(self, channels_first: bool = True) -> torch.Tensor:
-        spatial = self.spatial_shape[:self.ndim]
-        N, C = self.features.shape
+        spatial = self.spatial_shape[: self.ndim]
+        _N, C = self.features.shape
         B = self.batch_size
 
         if channels_first:
-            dense = torch.zeros((B, C, *spatial), dtype=self.features.dtype,
-                                device=self.features.device)
+            dense = torch.zeros(
+                (B, C, *spatial), dtype=self.features.dtype, device=self.features.device
+            )
         else:
-            dense = torch.zeros((B, *spatial, C), dtype=self.features.dtype,
-                                device=self.features.device)
+            dense = torch.zeros(
+                (B, *spatial, C), dtype=self.features.dtype, device=self.features.device
+            )
 
         indices = self.indices.long()
         valid = (indices[:, 0] >= 0) & (indices[:, 0] < B)
@@ -99,36 +103,48 @@ class SparseConvTensor:
                 z = valid_idx[:, 3]
                 # dense is (B, C, D, H, W); flat index of (b, c, x, y, z):
                 # b*C*D*H*W + c*D*H*W + x*H*W + y*W + z
-                base = (b * C * spatial[0] * spatial[1] * spatial[2] +
-                        x * spatial[1] * spatial[2] +
-                        y * spatial[2] + z)
-                c_offset = torch.arange(
-                    C, device=valid_feat.device) * spatial[0] * spatial[1] * spatial[2]
+                base = (
+                    b * C * spatial[0] * spatial[1] * spatial[2]
+                    + x * spatial[1] * spatial[2]
+                    + y * spatial[2]
+                    + z
+                )
+                c_offset = (
+                    torch.arange(C, device=valid_feat.device)
+                    * spatial[0]
+                    * spatial[1]
+                    * spatial[2]
+                )
             else:
                 # dense is (B, C, H, W); flat index of (b, c, x, y):
                 # b*C*H*W + c*H*W + x*W + y
-                base = (b * C * spatial[0] * spatial[1] +
-                        x * spatial[1] + y)
-                c_offset = torch.arange(
-                    C, device=valid_feat.device) * spatial[0] * spatial[1]
+                base = b * C * spatial[0] * spatial[1] + x * spatial[1] + y
+                c_offset = (
+                    torch.arange(C, device=valid_feat.device) * spatial[0] * spatial[1]
+                )
             flat_idx = base.unsqueeze(1) + c_offset.unsqueeze(0)
             dense.view(-1).scatter_add_(0, flat_idx.reshape(-1), valid_feat.reshape(-1))
         else:
             if self.ndim == 3:
                 x, y, z = valid_idx[:, 1], valid_idx[:, 2], valid_idx[:, 3]
-                flat = (valid_idx[:, 0] * spatial[0] * spatial[1] * spatial[2] +
-                        x * spatial[1] * spatial[2] + y * spatial[2] + z)
+                flat = (
+                    valid_idx[:, 0] * spatial[0] * spatial[1] * spatial[2]
+                    + x * spatial[1] * spatial[2]
+                    + y * spatial[2]
+                    + z
+                )
             else:
                 x, y = valid_idx[:, 1], valid_idx[:, 2]
-                flat = (valid_idx[:, 0] * spatial[0] * spatial[1] +
-                        x * spatial[1] + y)
+                flat = valid_idx[:, 0] * spatial[0] * spatial[1] + x * spatial[1] + y
             flat = flat.unsqueeze(1).expand(-1, C)
             dense.view(-1, C).scatter_add_(0, flat, valid_feat)
 
         return dense
 
     @staticmethod
-    def from_dense(dense: torch.Tensor, channels_first: bool = True) -> 'SparseConvTensor':
+    def from_dense(
+        dense: torch.Tensor, channels_first: bool = True
+    ) -> "SparseConvTensor":
         """从密集张量构建稀疏张量"""
         if channels_first:
             # (B, C, D, H, W) -> 提取非零位置
@@ -156,12 +172,13 @@ class SparseConvTensor:
             features = torch.stack(features_list).float()
         else:
             indices = torch.empty(0, 4, dtype=torch.int32, device=dense.device)
-            features = torch.empty(0, C if channels_first else dense.shape[-1],
-                                   device=dense.device)
+            features = torch.empty(
+                0, C if channels_first else dense.shape[-1], device=dense.device
+            )
 
         return SparseConvTensor(features, indices, (D, H, W), B)
 
-    def to(self, device) -> 'SparseConvTensor':
+    def to(self, device) -> "SparseConvTensor":
         """设备迁移，返回新对象。新对象拥有独立的特征/坐标副本，修改不影响原对象。
 
         注意：官方 spconv 的 SparseConvTensor.to() 同样返回新对象。
@@ -176,17 +193,19 @@ class SparseConvTensor:
         out.indice_dict = self.indice_dict
         return out
 
-    def cpu(self) -> 'SparseConvTensor':
-        return self.to('cpu')
+    def cpu(self) -> "SparseConvTensor":
+        return self.to("cpu")
 
-    def cuda(self) -> 'SparseConvTensor':
-        return self.to('cuda')
+    def cuda(self) -> "SparseConvTensor":
+        return self.to("cuda")
 
     def __repr__(self):
-        return (f"SparseConvTensor(features={self.features.shape}, "
-                f"indices={self.indices.shape}, "
-                f"spatial_shape={self.spatial_shape}, "
-                f"batch_size={self.batch_size})")
+        return (
+            f"SparseConvTensor(features={self.features.shape}, "
+            f"indices={self.indices.shape}, "
+            f"spatial_shape={self.spatial_shape}, "
+            f"batch_size={self.batch_size})"
+        )
 
 
 class SparseModule(nn.Module):
@@ -205,10 +224,12 @@ class SparseModule(nn.Module):
 _SPARSE_MODULE_TYPES: tuple = (SparseModule,)
 try:
     import spconv.pytorch as _sp_pt
+
     _SPARSE_MODULE_TYPES = (SparseModule, _sp_pt.SparseModule)
 except ImportError:
     try:
         from mmcv.ops import SparseModule as _mmcv_sp
+
         _SPARSE_MODULE_TYPES = (SparseModule, _mmcv_sp)
     except (ImportError, AttributeError):
         pass
@@ -242,7 +263,9 @@ class SparseSequential(SparseModule):
         - 普通 nn.Module（BatchNorm/ReLU 等）只作用在 .features 上，再 replace_feature。
         """
         for module in self:
-            if isinstance(x, SparseConvTensor) and not isinstance(module, _SPARSE_MODULE_TYPES):
+            if isinstance(x, SparseConvTensor) and not isinstance(
+                module, _SPARSE_MODULE_TYPES
+            ):
                 x = x.replace_feature(module(x.features))
             else:
                 x = module(x)
@@ -251,7 +274,7 @@ class SparseSequential(SparseModule):
     def __len__(self):
         return len(self._modules)
 
-    def __getitem__(self, idx) -> Union[SparseModule, 'SparseSequential']:
+    def __getitem__(self, idx) -> SparseModule | "SparseSequential":
         """支持索引访问"""
         if isinstance(idx, slice):
             modules = list(self._modules.values())[idx]
@@ -267,16 +290,23 @@ class SparseSequential(SparseModule):
 # 适配层：让 SparseConv3dCPU / SubMConv3dCPU 接受 SparseConvTensor
 # ============================================================
 
+
 class SparseConv3dAdapter(SparseModule):
     """将 SparseConv3d 适配为 SparseModule 接口"""
 
-    def __init__(self, in_channels, out_channels, kernel_size,
-                 stride=1, padding=0, bias=True):
+    def __init__(
+        self, in_channels, out_channels, kernel_size, stride=1, padding=0, bias=True
+    ):
         super().__init__()
         from .conv import SparseConv3d as SparseConv3dCPU
+
         self.conv = SparseConv3dCPU(
-            in_channels, out_channels, kernel_size,
-            stride=stride, padding=padding, bias=bias
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            bias=bias,
         )
 
     def forward(self, x: SparseConvTensor) -> SparseConvTensor:
@@ -287,14 +317,27 @@ class SparseConv3dAdapter(SparseModule):
 class SubMConv3dAdapter(SparseModule):
     """将 SubMConv3d 适配为 SparseModule 接口"""
 
-    def __init__(self, in_channels, out_channels, kernel_size,
-                 stride=1, padding=0, dilation=1, bias=True):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+        bias=True,
+    ):
         super().__init__()
         from .conv import SubMConv3d as SubMConv3dCPU
+
         self.conv = SubMConv3dCPU(
-            in_channels, out_channels, kernel_size,
-            stride=stride, padding=padding,
-            dilation=dilation, bias=bias
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            bias=bias,
         )
 
     def forward(self, x: SparseConvTensor) -> SparseConvTensor:
@@ -305,6 +348,7 @@ class SubMConv3dAdapter(SparseModule):
 # ============================================================
 # 常用激活/归一化层的稀疏适配
 # ============================================================
+
 
 class SparseReLU(SparseModule):
     def __init__(self, inplace: bool = False):

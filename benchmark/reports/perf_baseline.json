@@ -1,0 +1,45 @@
+{
+  "generated_at": "2026-09-19T11:47:40",
+  "sections": {
+    "bev_pool_results": {
+      "2000": {
+        "torch_ms": 29.809,
+        "ascendc_ms": 1.964
+      },
+      "8000": {
+        "torch_ms": 25.344,
+        "ascendc_ms": 2.448
+      },
+      "32000": {
+        "torch_ms": 29.457,
+        "ascendc_ms": 4.62
+      },
+      "128000": {
+        "torch_ms": 56.539,
+        "ascendc_ms": 12.082
+      },
+      "512000": {
+        "torch_ms": 115.507,
+        "ascendc_ms": 27.216
+      }
+    },
+    "voxelization_results": {
+      "5000": {
+        "ascendc_ms": 2.457,
+        "numpy_ms": 3.608
+      },
+      "20000": {
+        "ascendc_ms": 6.031,
+        "numpy_ms": 15.055
+      },
+      "50000": {
+        "ascendc_ms": 12.876,
+        "numpy_ms": 38.97
+      },
+      "100000": {
+        "ascendc_ms": 23.704,
+        "numpy_ms": 80.459
+      }
+    }
+  }
+}

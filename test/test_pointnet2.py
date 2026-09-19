@@ -21,19 +21,13 @@
 """
 
 import importlib
-import os
 import sys
 from types import ModuleType
 
 import pytest
 import torch
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_PKG_ROOT = os.path.normpath(os.path.join(_HERE, "..", "src", "unum_ops"))
-if _PKG_ROOT not in sys.path:
-    sys.path.insert(0, _PKG_ROOT)
-
-from pointnet2 import (
+from unum_ops.pointnet2 import (
     CylinderQueryAndGroup,
     GroupAll,
     QueryAndGroup,
@@ -318,7 +312,7 @@ class TestBackend:
 
     def test_module_imports_without_cuda(self):
         """无 CUDA extension 环境下模块可正常导入且算子可用"""
-        import pointnet2 as pn2
+        import unum_ops.pointnet2 as pn2
 
         # 模块应有全部公开接口
         for name in (
@@ -335,7 +329,7 @@ class TestBackend:
 
     def test_torch_fallback_correctness(self):
         """torch 实现可直接调用（与顶层接口等价）"""
-        import pointnet2 as pn2
+        import unum_ops.pointnet2 as pn2
 
         xyz = torch.randn(1, 10, 3)
         # 无论是否被 CUDA 替换，调用签名一致
@@ -345,7 +339,7 @@ class TestBackend:
 
     def test_onnx_variant_always_available(self):
         """*_onnx 变体始终存在（不参与 CUDA 替换）"""
-        import pointnet2 as pn2
+        import unum_ops.pointnet2 as pn2
 
         assert callable(pn2.three_interpolate_onnx)
         assert callable(pn2.grouping_operation_onnx)
@@ -394,7 +388,7 @@ class TestBackend:
             setattr(fake, name, _fake_op(name))
         # 故意不提供 knn：验证 hasattr 分支，knn 应保持 torch 版
 
-        import pointnet2 as pn2
+        import unum_ops.pointnet2 as pn2
 
         monkeypatch.setitem(sys.modules, "pointnet2_utils", fake)
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)

@@ -62,7 +62,8 @@ IS_CPU = detect_device() == "cpu"
 # ============================================================
 # 延迟导入子模块
 # ============================================================
-for _mod in ("infllm_v2", "sparse_kernel_extension", "voxelization", "spconv", "pointnet2"):
+for _mod in ("bev_pool", "bev_pool_v3", "infllm_v2", "sparse_kernel_extension",
+             "voxelization", "spconv", "pointnet2"):
     try:
         __import__(f"unum_ops.{_mod}")
     except ImportError:
@@ -94,6 +95,8 @@ INTERFACES_310P: dict[str, dict[str, tuple[bool, str]]] = {
         "SparseConv2d": (True, "纯 torch"),
         "SparseInverseConv3d": (True, "纯 torch"),
         "SparseInverseConv2d": (True, "纯 torch"),
+        "SparseConv3dCPU": (True, "SparseConv3d 兼容旧名"),
+        "SubMConv3dCPU": (True, "SubMConv3d 兼容旧名"),
         "VoxelGeneratorV2": (True, "纯 numpy"),
         "VoxelGenerator": (True, "纯 numpy"),
     },
@@ -101,32 +104,46 @@ INTERFACES_310P: dict[str, dict[str, tuple[bool, str]]] = {
         "infllmv2_attn_stage1_ref_torch": (True, "纯 torch 参考实现"),
         "infllmv2_attn_stage1_triton": (False, "triton kernel，需 CUDA"),
         "infllmv2_attn_stage1_triton_v2": (False, "triton kernel，需 CUDA"),
+        "infllmv2_attn_stage1": (False, "triton kernel 别名（= triton_v2），需 CUDA"),
         "max_pooling_1d_varlen_ref_triton": (False, "triton kernel，需 CUDA"),
+        "max_pooling_1d_varlen": (False, "triton kernel 别名（= ref_triton），需 CUDA"),
     },
     "sparse_kernel_extension": {
         "get_block_table_ref_torch": (True, "纯 torch 参考实现"),
         "get_block_table_ref_triton": (False, "triton kernel，需 CUDA"),
         "get_block_table_ref_triton_v2": (False, "triton kernel，需 CUDA"),
         "get_block_table_ref_triton_v3": (False, "triton kernel，需 CUDA"),
+        "get_block_table_v2": (False, "triton kernel 别名（= ref_triton_v2），需 CUDA"),
+        "get_block_table_v3": (False, "triton kernel 别名（= ref_triton_v3），需 CUDA"),
     },
     "voxelization": {
         "voxelization": (True, "AscendC 自定义算子，需先编译 .so"),
         "VoxelizationOutput": (True, "纯 python 数据结构"),
+        "voxelization_torch": (True, "纯 torch 实现"),
+        "voxelization_torch_ref": (True, "纯 torch 参考实现"),
     },
     "bev_pool": {
         "bev_pool": (True, "AscendC 自定义算子，需先编译 .so"),
         "bev_pool_torch": (True, "纯 torch scatter_add 实现"),
         "BevPoolOutput": (True, "纯 python 数据结构"),
     },
+    "bev_pool_v3": {
+        "bev_pool_v3": (True, "AscendC 自定义算子，需先编译 .so"),
+        "BevPoolV3Output": (True, "纯 python 数据结构"),
+    },
     "pointnet2": {
         "furthest_point_sample": (True, "纯 torch 循环；CPU eager 走 numpy 就地快路径(~8x)，trace 时回退 torch；NPU 时 CPU fallback"),
         "furthest_point_sample_onnx": (True, "纯 torch 循环，ONNX 可导出（不包 autograd.Function）"),
+        "furthest_point_sample_torch": (True, "纯 torch 循环"),
         "gather_operation": (True, "纯 torch.gather"),
         "three_nn": (True, "纯 torch cdist+topk"),
         "three_interpolate": (True, "纯 torch，k=3 循环"),
+        "three_interpolate_torch": (True, "纯 torch，k=3 循环"),
         "grouping_operation": (True, "纯 torch，nsample 循环"),
+        "grouping_operation_torch": (True, "纯 torch，nsample 循环"),
         "ball_query": (True, "纯 torch cdist+where，NPU 时 CPU fallback"),
         "cylinder_query": (True, "纯 torch matmul+where，NPU 时 CPU fallback"),
+        "cylinder_query_torch": (True, "纯 torch matmul+where"),
         "three_interpolate_onnx": (True, "纯 torch，ONNX 可导出"),
         "grouping_operation_onnx": (True, "纯 torch，ONNX 可导出"),
         "cylinder_query_onnx": (True, "纯 torch 全向量化，ONNX 可导出"),
@@ -224,7 +241,10 @@ __all__ = [
     "IS_CPU",
     "IS_CUDA",
     "IS_NPU",
+    "bev_pool",
+    "bev_pool_v3",
     "detect_device",
+    "infllm_v2",
     "is_310p_compatible",
     "is_available",
     "list_310p_interfaces",

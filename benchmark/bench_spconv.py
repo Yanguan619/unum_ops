@@ -10,13 +10,6 @@ NPU：torch einsum vs AscendC 内核（完整卷积前向）。
     python benchmark/bench_spconv.py
     python -m pytest benchmark/bench_spconv.py -v
 """
-import os
-import sys
-
-_HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(_HERE, "..", "src", "unum_ops"))
-sys.path.insert(0, _HERE)
-
 import numpy as np
 import pytest
 import torch
@@ -24,10 +17,10 @@ import torch.nn as nn
 import torch_npu
 
 from bench_utils import Benchmark, do_bench, perf_report
-from spconv import ascendc
-import spconv.conv as conv_mod
-from spconv.conv import SubMConv3d, SparseConv3d, SparseInverseConv3d
-from spconv.sparse_modules import SparseConvTensor, SparseSequential
+from unum_ops.spconv import spconv_ascendc as ascendc
+import unum_ops.spconv.conv as conv_mod
+from unum_ops.spconv.conv import SubMConv3d, SparseConv3d, SparseInverseConv3d
+from unum_ops.spconv.sparse_modules import SparseConvTensor, SparseSequential
 
 NPU_AVAIL = hasattr(torch, "npu") and torch.npu.is_available()
 if NPU_AVAIL:

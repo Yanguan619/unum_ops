@@ -1,7 +1,7 @@
 """hatchling 构建钩子：依赖管理 + AscendC 扩展自动编译。
 
 Metadata hook — 动态解析依赖（310P 跳过 triton）。
-Build hook    — 在 Ascend 310P 上自动编译 bev_pool / voxelization 的 C 扩展 .so。
+Build hook    — 在 Ascend 310P 上自动编译 AscendC 扩展 .so（清单见 _EXTENSIONS）。
 """
 
 import os
@@ -70,6 +70,14 @@ _EXTENSIONS = [
         "so_name": "libbev_pool_ops.so",
         "require_headers": ["aclnn_bev_pool.h"],
         "opp_source_dir": "csrc/ascend/bev_pool",
+    },
+    {
+        "name": "bev_pool_v3",
+        "vendor": "bevpoolV3",
+        "src_dir": "csrc/ascend/bevpoolV3/op_extension",
+        "so_name": "libbevpoolV3_ops.so",
+        "require_headers": ["aclnn_bev_pool_v3.h"],
+        "opp_source_dir": "csrc/ascend/bevpoolV3",
     },
     {
         "name": "voxelization",
